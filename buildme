@@ -1,0 +1,1335 @@
+#!/usr/bin/env python3
+# Use README.md as a literate build tool.
+#
+# Parse structured text into shell invocations with supporting prerequisite
+# checks (programs on PATH, generally), repo clones, and checksum-verified web
+# downloads. When a code block has a documented effect of creating specific
+# files and directories, provide build caching and `clean` workflows.
+#
+# Indicate build instructions with markdown and a few English words.
+#
+# When editing a .md file, use `--outline` and `--export` to confirm document
+# structure, because the literate approach ignores unknown text by default.
+#
+# Use only the Python standard library. Require Python 3.6+.
+
+# Flow of command-line application:
+#
+#     Main
+#     Project(*filename)
+#       Document(filename)  # Markdown parsed here.
+#     Runner(project).run   # Build runs here.
+#       Output
+
+__version__ = "0.0-dev"
+
+PROG = "buildme"
+
+import sys
+
+if sys.version_info < (3, 6):
+    sys.stderr.write(PROG + " error: Python 3.6+ required\n")
+    sys.exit(128)
+
+import argparse
+import collections
+import contextlib
+import doctest
+import functools
+import inspect
+import itertools
+import json
+import os
+import platform
+import re
+import traceback
+
+
+### Style Note
+#
+# This module uses singular names. Everything is a vector.
+#
+#   project                        Project
+#     .document = [d]              Document
+#       .section = [sec]           Section
+#         .component = [cmp]       Component
+#
+###
+
+
+## Class Utility
+
+
+class classproperty(property):
+    "Use a class method as a property (combine @classmethod with @property)."
+
+    def __get__(decorator, _, cls):
+        return decorator.fget(cls)
+
+
+## Data Model & Text Parsing
+
+
+class Project:
+    """A collection of README/markdown files to run as a build system.
+
+    Class composition, each has zero or many instances of the objects below it:
+
+        Project
+          Document
+            Section
+              Component (subclasses)
+
+    A Project is a collection of files specified via command line (argv).
+    A Document maps to a text file.
+    A Section is marked by a heading in the text.
+    Build Components within a Section are parsed from the section text.
+    """
+
+    def __init__(self, *filename):
+        self.filename = filename
+        self.document = [Document(f) for f in filename]
+
+    def export(self):
+        "Convert object to dictionary."
+        return {"document": [d.export() for d in self.document]}
+
+    def outline(self):
+        "Provide human-readable outline of Project features."
+        return "\n".join(d.outline() for d in self.document)
+
+    def __repr__(self):
+        arg = ", ".join(repr(f) for f in self.filename)
+        return f"{self.__class__.__name__}({arg})"
+
+
+class Document:
+    "A structured text file to parse as build instructions."
+
+    def __init__(self, filename):
+        self.filename = filename
+        self.name = None
+        self.level = 1
+        self.parse()
+
+    def export(self):
+        "Convert object to dictionary."
+        return {
+            "filename": self.filename,
+            "level": self.level,
+            "name": self.name,
+            "section": [sec.export() for sec in self.section],
+        }
+
+    def outline(self):
+        "Provide human-readable outline of Document features."
+        return "\n".join(
+            [f"{' ' * (self.level - 1)}{self.title}"]
+            + [sec.outline() for sec in self.section]
+        )
+
+    def parse(self):
+        "Parse Document title and collection of Section build details."
+        with context(filename=self.filename):
+            with open_file_or_stdin(self.filename) as file:
+                header_attr, self.section = DocumentParser().parse(file.read())
+                if header_attr:
+                    self.name, self.level = header_attr
+
+    @property
+    def title(self):
+        "The top heading in the text, if it exists; else the filename."
+        return self.name or self.filename
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.filename!r})"
+
+
+class Section:
+    """A section of Document text defining steps of the build process.
+
+    Instantiated with a list of Component instances parsed by DocumentParser.
+    """
+
+    def __init__(self, component, name=None, level=None):
+        self.component = component
+        self.name = name or None
+        self.level = level or 1
+        self.empty = not bool(component)
+        self.index()
+
+    @classproperty
+    def component_base_cls(cls):
+        "Handle to Component base class."
+        return Component
+
+    @classproperty
+    def component_cls(cls):
+        "Resolve Component class set of features appearing in text."
+        return set(filter(lambda c: c.parse, subclass(cls.component_base_cls)))
+
+    def export(self):
+        "Convert object to dictionary."
+        return {
+            "component": [cmp.export() for cmp in self.component],
+            "level": self.level,
+            "line": self.line_number,
+            "name": self.name,
+        }
+
+    def index(self):
+        "Index component collection by Component category."
+        for category in self.component_base_cls.category_set:
+            setattr(self, category, [])
+        for cmp in self.component:
+            getattr(self, cmp.category).append(cmp)
+
+    def outline(self):
+        "Provide human-readable outline of Section features."
+        indent = " " * (self.level - 1)
+        line = []
+
+        if self.name:
+            line.append(f"{indent}{self.name}")
+
+        by_category = lambda x: x.category
+        for category, xs in itertools.groupby(self.component, key=by_category):
+            xs = list(xs)
+            if not xs[0].outline_info():
+                if len(xs) == 1:
+                    line += [f"{indent} {category}"]
+                else:
+                    line += [f"{indent} {category} x{len(xs)}"]
+            elif len(xs) == 1:
+                line += [f"{indent} {xs[0].outline()}"]
+            else:
+                line += [f"{indent} {category}:"]
+                for x in xs:
+                    line += [f"{indent}  {x.outline_info()}"]
+
+        return "\n".join(line)
+
+    def __repr__(self):
+        arg = f"name={self.name!r}, level={self.level!r}"
+        return f"{self.__class__.__name__}({arg})"
+
+
+class Format:
+    """Mixin to encode how to extract a given build Component from text.
+
+    Given that a Component is primarily a data class and only has a few
+    declarative attributes on how it appears in text, it would be too much
+    responsibility to manage state of a recursive descent parser.
+
+    Mix in Format definitions instead.
+    """
+
+    @classmethod
+    def parser(cls):
+        "Define a `parse` callable for DocumentParser."
+        raise NotImplementedError("Every Format must provide parser callable.")
+
+
+class Header(Format):
+    """A markdown header, creating instances via `parser`.
+
+    Not a subclass of Component, as a Header is not part of a Section.
+    A Document has one Section per Header.
+    """
+
+    def __init__(self, name, level):
+        self.name = name
+        self.level = level
+
+    @classmethod
+    def parser(cls):
+        "Define a `parse` callable for DocumentParser."
+
+        class Parser:
+            def __init__(self):
+                self.previous = ""
+
+            def __call__(self, line):
+                obj = None
+                match = re.match(r"(#+)\s+(.*)", line)
+                if match is not None:
+                    # Header formatted with leading `#` characters.
+                    obj = cls(name=match.group(2), level=len(match.group(1)))
+                elif re.match(r"^(=+|-+)$", line):
+                    if len(line) == len(self.previous):
+                        # Header formatted with underline characters.
+                        level = 1 if "=" in line else 2
+                        obj = cls(name=self.previous, level=level)
+                self.previous = "" if obj else line  # Avoid duplicates.
+                return obj
+
+        return Parser()
+
+    def __repr__(self):
+        arg = f"name={self.name!r}, level={self.level!r}"
+        return f"{self.__class__.__name__}({arg})"
+
+
+class DocumentParser:
+    "Parse Section instances from a Document text."
+    header_cls = Header
+    section_cls = Section
+
+    def nonempty(self, section):
+        "Filter Section collection to instances that are not empty."
+        return list(filter(lambda s: not s.empty, section))
+
+    def parse(self, text):
+        """Parse Document text into zero or more Section instances.
+
+        1. Get parser from classmethod of each Component subclass.
+        2. Pass each line of text to every parser, collect non-None results.
+        3. Build a Section instance containing all parsed components.
+        """
+        parser = [cls.parser() for cls in self.section_cls.component_cls]
+        parse_header = self.header_cls.parser()
+
+        section = []
+        component = []
+        prev = None
+
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            with context(line_number=line_number, line=line):
+                line = line.rstrip()
+                header = parse_header(line)
+
+                if header:
+                    header.line_number = line_number
+                    if prev:
+                        section.append(self.section(component, prev))
+                    component = []  # Reset.
+                    prev = header
+
+                for parse in parser:
+                    parsed = parse(line)
+                    if parsed:
+                        if not getattr(parsed, "line_number", None):
+                            parsed.line_number = line_number
+                        component.append(parsed)
+
+        section.append(self.section(component, prev))
+
+        return self.title(section), self.nonempty(section)
+
+    def section(self, component, header):
+        "Create a Section instance from a Header and result of text parsing."
+        section = self.section_cls(
+            component,
+            # Support header-less Section (i.e. text with no headers).
+            getattr(header, "name", None),
+            getattr(header, "level", None),
+        )
+        section.line_number = getattr(header, "line_number", 1)
+        return section
+
+    def title(self, section):
+        """Determine Document title heading (name, level) from parsed sections.
+
+        If the first section has a header that is greater than all other
+        sections in the text, then it is the Document title.
+
+        This requires the Section collection to be unfiltered, i.e. it must
+        include empty Section instances in order to be accurate.
+        """
+        if not section:
+            return None, 1
+
+        first = section[0].level
+        same = list(filter(lambda h: h.level <= first, section[1:]))
+        if not same:
+            return section[0].name, section[0].level
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class ListItem(Format):
+    "A markdown list item, creating instances via `parser`."
+    conditional_lead_in = None
+
+    @classmethod
+    def lead_in_pattern(cls, lead_in):
+        "Format lead-in pattern based on declarative subclass attribute."
+        if not lead_in:
+            return None
+
+        if lead_in is not None and not isinstance(lead_in, str):
+            lead_in = "|".join(lead_in)
+
+        return r"({}).*:$".format(lead_in.lower())
+
+    @classmethod
+    def parser(cls):
+        "Define a `parse` callable for DocumentParser."
+
+        class Parser:
+            def __init__(self):
+                self.cond_re = cls.lead_in_pattern(cls.conditional_lead_in)
+                self.lead_in_re = cls.lead_in_pattern(cls.lead_in)
+                self.list_item_re = r"\s*([0-9]\.|[\+\-\*])\s"
+
+                self.reset()
+
+            def reset(self):
+                self.state = "seeking"
+                self.conditional = False
+                self.text = None
+
+            def __call__(self, line):
+                if self.state == "seeking":
+                    self.seeking(line)
+                elif self.state == "pending":
+                    self.pending(line)
+                if self.state == "item":
+                    return self.item(line)
+
+            def seeking(self, line):
+                if re.match(self.lead_in_re, line.lower()):
+                    self.state = "pending"
+
+                if self.cond_re and re.match(self.cond_re, line.lower()):
+                    self.state = "pending"
+                    self.conditional = True
+
+            def pending(self, line):
+                if line:
+                    self.state = "item"
+
+            def item(self, line):
+                if line:
+                    if re.match(self.list_item_re, line):
+                        content = re.sub(self.list_item_re, "", line)
+                        return self.content(content)
+                else:
+                    self.state = "seeking"
+                    self.conditional = False
+
+            def content(self, line):
+                pattern = cls.re
+                if isinstance(pattern, str):
+                    pattern = [pattern]
+
+                for candidate in pattern:
+                    match = re.search(candidate, line)
+                    if match:
+                        groups = match.groups()
+                        if hasattr(cls, "process_groups"):
+                            groups = cls.process_groups(groups)
+                        if self.conditional:
+                            return cls(*groups, conditional=True)
+                        return cls(*groups)
+
+        return Parser()
+
+
+class CodeBlock(Format):
+    "A markdown code block, creating instances via `parser`."
+
+    @classmethod
+    def parser(cls):
+        "Define a `parse` callable for DocumentParser."
+
+        if isinstance(cls.lead_in, str):
+            lead_in = cls.lead_in
+        else:
+            lead_in = "|".join(cls.lead_in)
+
+        class Parser:
+            def __init__(self):
+                self.lead_in_re = r"({}).*:$".format(lead_in.lower())
+
+                self.line_number = None  # Track line where code block starts.
+                self.state = "seeking"
+                self.code = []
+
+            def __call__(self, line):
+                if self.state == "seeking":
+                    self.seeking(line)
+                elif self.state == "pending":
+                    self.pending(line)
+                    if self.state != "pending":
+                        self.line_number = context.get("line_number")
+                    if self.state == "fenced":
+                        return None  # Skip.
+
+                parsed = None
+
+                if self.state == "fenced":
+                    parsed = self.fenced(line)
+                elif self.state == "indented":
+                    parsed = self.indented(line)
+
+                if parsed:
+                    if "\n" in parsed and not parsed.endswith("\n"):
+                        parsed += "\n"
+                    obj = cls(parsed)
+                    obj.line_number, self.line_number = self.line_number, None
+                    return obj
+
+            def seeking(self, line):
+                if re.match(self.lead_in_re, line.lower()):
+                    self.state = "pending"
+
+            def pending(self, line):
+                if re.match(r"```\S*$", line):
+                    self.state = "fenced"
+                elif line.startswith("    "):
+                    self.state = "indented"
+
+            def fenced(self, line):
+                if line != "```":
+                    self.code.append(line)
+                else:
+                    code, self.code = self.code, []
+                    self.state = "seeking"
+                    return "\n".join(code)
+
+            def indented(self, line):
+                if line.startswith("    "):
+                    self.code.append(line[4:])
+                else:
+                    code, self.code = self.code, []
+                    self.state = "seeking"
+                    return "\n".join(code)
+
+        return Parser()
+
+
+class Comment(Format):
+    "A comment in HTML, creating instances via `parser`."
+
+    @classmethod
+    def parser(cls):
+        "Define a `parse` callable for DocumentParser."
+
+        if isinstance(cls.lead_in, str):
+            lead_in = cls.lead_in
+        else:
+            lead_in = "|".join(cls.lead_in)
+
+        def parse(line):
+            pattern = r"\s*<!--\s*{}:\s*(.*)\s*-->".format(lead_in.lower())
+            match = re.match(pattern, line)
+            if match:
+                comment = match.group(1).strip()
+                if hasattr(cls, "parse_line"):
+                    return cls(cls.parse_line(comment))
+                return cls(comment)
+            return None
+
+        return parse
+
+
+class DelimitedComment(Comment):
+    "A delimited list of items packed into a comment in HTML."
+
+    delimiter = ","
+
+    @classmethod
+    def parse_line(self, line):
+        "Process line matched by Comment parser, unpack collection."
+        return [item.strip() for item in line.split(self.delimiter)]
+
+
+class Component:
+    "A feature within a Section describing a component of the build process."
+    category = None
+    export_exclude = None
+    export_include = None
+    lead_in = None
+    parse = False
+    re = None
+    subcategory = None
+
+    @classproperty
+    def category_set(cls):
+        return set(c.category for c in subclass(cls) if c.category)
+
+    def export(self):
+        "Convert object to dictionary."
+        include = self.export_include or []
+        exclude = self.export_exclude or []
+        export = {"category": self.category, "line": self.line_number}
+        if getattr(self, "subcategory", None):
+            export["subcategory"] = self.subcategory
+        for key in list(inspect.signature(self.__init__).parameters) + include:
+            if key in exclude:
+                continue
+            value = getattr(self, key, None)
+            if callable(getattr(value, "export", None)):
+                value = value.export()
+            export[key] = value
+        return export
+
+    def outline(self):
+        "Provide human-readable outline information of Component feature."
+        line = self.outline_info()
+        if line:
+            return f"{self.category}: {line}"
+        return self.category
+
+    def outline_info(self):
+        "Provide outline information using first positional argument."
+        for key in inspect.signature(self.__init__).parameters:
+            value = getattr(self, key, None)
+            if type(value) in (list, tuple):
+                value = ", ".join(value)
+            return str(value) if value else None
+
+    def __repr__(self):
+        arg = ", ".join(
+            f"{p}={getattr(self, p)!r}"
+            for p in inspect.signature(self.__init__).parameters
+        )
+        return f"{self.__class__.__name__}({arg})"
+
+
+class Prerequisite(Component, ListItem):
+    "A requirement that must be met before running the build."
+    category = "prerequisite"
+    conditional_lead_in = r"if\s+.*\s*(is|are)\s+(missing|needed|not)"
+    export_exclude = ["value"]
+    lead_in = "require[sd]?|make sure"
+
+    def __init__(self, value, conditional=False):
+        self.value = value
+        self.conditional = conditional
+        setattr(self, self.subcategory, value)
+
+    @classproperty
+    def export_include(cls):
+        "Export a field keyed by derived subcategory."
+        return [cls.subcategory]
+
+    @classproperty
+    def subcategory(cls):
+        "Derive subcategory attribute from class name."
+        return cls.__name__.replace("Prerequisite", "").lower()
+
+
+class ProgramPrerequisite(Prerequisite):
+    "A program that must be on the $PATH before running the build."
+    parse = True
+    re = r"`([^\s/\\]*)`"
+
+
+class FilePrerequisite(Prerequisite):
+    "A file that must exist on the filesystem before running the build."
+    parse = True
+    re = [
+        r"`(.*/.*)`",
+        r"`(.*\\.*)`",
+    ]
+
+
+class ExpressionPrerequisite(Prerequisite):
+    "A shell expression that must successfully run before running the build."
+    parse = True
+    re = r"`(.* .*)`"
+
+
+class Download(Component, ListItem):
+    "A download step as part of the build."
+    category = "download"
+
+
+class TagSpec:
+    "Mixin to extract tags from a regular expression group."
+
+    @classmethod
+    def process_groups(cls, groups):
+        "Parse list of tags from comma-delimited text."
+        i = getattr(cls, "tag_group", 1) - 1  # re match is 1-indexed.
+        if i >= len(groups):
+            return groups
+        head, tag_spec, tail = groups[:i], groups[i], groups[i + 1 :]
+
+        if tag_spec:
+            tag = tag_spec.replace(",", "").replace(" and ", " ").split(" ")
+        else:
+            tag = []
+
+        return head + (tag,) + tail
+
+
+class RepoClone(Download, TagSpec):
+    "A repository to clone as part of the build."
+    lead_in = "clone"
+    parse = True
+    re = [
+        r"(\S+)\s+as\s+(.*)\s+including\s+tags?\s+(.*)",
+        r"(\S+)\s+()including\s+tags?\s+(.*)",
+        r"(\S+)\s+a[ts]\s+(.*)\s+tags?\s+(.*)",
+        r"(\S+)\s+()tags?\s+(.*)",
+        r"(\S+)",
+    ]
+    subcategory = "clone"
+    tag_group = 3
+
+    def __init__(self, repo, directory=None, tag=None):
+        self.repo = repo
+        self.directory = directory or None
+        self.tag = tag or None
+
+    def outline_info(self):
+        "Provide info on clone configuration."
+        line = self.repo
+        if self.directory:
+            line += f" as {self.directory}"
+        if self.tag:
+            line += f" ({', '.join(self.tag)})"
+        return line
+
+
+class Checksum:
+    "An algorithm and checksum for use in download verification."
+
+    def __init__(self, algorithm, checksum):
+        self.algorithm = algorithm
+        self.checksum = checksum
+
+    def export(self):
+        "Convert object to dictionary."
+        return vars(self)
+
+    def __repr__(self):
+        arg = f"{self.algorithm!r}, {self.checksum!r}"
+        return f"{self.__class__.__name__}({arg})"
+
+
+class DownloadAttributes:
+    "Mixin to extract multiple attributes from a regular expression group."
+
+    algorithms = ("md5", "sha1", "sha224", "sha256", "sha384", "sha512")
+    delimiter = ";"
+    subdelimiter = ","
+
+    @classmethod
+    def parse_arch(cls, text):
+        "Parse one or more delimited values following 'arch:'."
+        match = re.match(r"arch:\s*(.*)", text.lower())
+        if match:
+            group = match.group(1)
+            if cls.subdelimiter in group:
+                return [arch.strip() for arch in group.split(cls.subdelimiter)]
+            return [group.strip()]
+
+    @classmethod
+    def parse_checksum(cls, text):
+        "Parse Checksum object from text notation."
+        pattern = r"({}):\s*(\S*)".format("|".join(cls.algorithms))
+        match = re.match(pattern, text.lower())
+        if match:
+            return Checksum(algorithm=match.group(1), checksum=match.group(2))
+
+    @classmethod
+    def process_groups(cls, groups):
+        i = getattr(cls, "attributes_group", 1) - 1  # re match is 1-indexed.
+        if i >= len(groups):
+            return groups
+        head, text, tail = groups[:i], groups[i], groups[i + 1 :]
+
+        attributes = {}
+
+        for part in text.split(cls.delimiter):
+            part = part.strip()
+            arch = cls.parse_arch(part)
+            checksum = cls.parse_checksum(part)
+            if arch:
+                attributes["arch"] = arch
+            elif checksum:
+                attributes["checksum"] = checksum
+            else:
+                raise DocumentError("unknown download attribute: " + part)
+
+        return head + (attributes,) + tail
+
+
+class WebDownload(Download, DownloadAttributes):
+    "A file to download from the web as part of the build."
+    action = "download"
+    attributes_group = 3
+    export_exclude = ["attributes"]
+    export_include = ["arch", "checksum"]
+    lead_in = "download"
+    parse = True
+    re = [
+        r"(\S+)\s+as\s+(\S+)\s+\((.*)\)",
+        r"(\S+)\s*()\((.*)\)",
+        r"(\S+)",
+    ]
+    subcategory = "web"
+
+    def __init__(self, url, filename=None, attributes={}):
+        self.url = url
+        self.filename = filename or None
+        self.attributes = attributes
+
+        self.arch = None
+        self.checksum = None
+        for k, v in attributes.items():
+            setattr(self, k, v)
+
+    def outline_info(self):
+        "Provide info on download configuration."
+        line = self.url
+        if self.filename:
+            line += f" as {self.filename}"
+        if self.checksum:
+            line += f" ({self.checksum.algorithm})"
+        return line
+
+
+class Script(Component, CodeBlock):
+    "A script to run as part of the build."
+    category = "script"
+    lead_in = [
+        "create|prep|prepare|setup",
+        "do|run",
+        "log",
+        "test",
+        "unarchive|unpack",
+    ]
+    parse = True
+
+    def __init__(self, code):
+        self.code = code
+
+    def outline_info(self):
+        "Skip code listing in outline."
+        return None
+
+
+class FileEffect(Component, DelimitedComment):
+    "A file or directory created by, and owned by, the Section's build."
+    category = "effect"
+    lead_in = "creates"
+    parse = True
+
+    def __init__(self, file):
+        self.file = file
+
+
+class Dependency(Component, DelimitedComment):
+    "Rebuild current Section if Section referenced as a Dependency changes."
+    category = "dependency"
+    lead_in = "requires?"
+    parse = True
+
+    def __init__(self, dependency):
+        self.dependency = dependency
+
+
+## Build Runner
+
+
+class Runner:
+    "Command-line entry point to run build for a Project."
+
+    def __init__(self, output, debug=False):
+        self.output = output
+        self.debug = debug
+
+    def clean(self, project):
+        self.out(f"{PROG}: work in progress: clean")
+
+    def err(self, *a, **kw):
+        self.out(*a, **kw)
+
+    def export(self, project):
+        self.out(json.dumps(project.export(), indent=2))
+
+    def outline(self, project):
+        self.out(project.outline())
+
+    def out(self, *a, **kw):
+        self.output.out(*a, **kw)
+
+    def run(self, project):
+        self.out(f"{PROG}: work in progress: run")
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.output!r})"
+
+
+## Build Output
+
+
+class Output:
+    "API for status information during build."
+
+    prog = PROG
+
+    def __init__(self, debug=False):
+        self.debug = debug
+
+    def out(self, message):
+        "Output message with stdout semantics."
+        raise NotImplementedError("subclass does not have `out` method")
+
+    def err(self, message):
+        "Output message with stderr semantics."
+        raise NotImplementedError("subclass does not have `err` method")
+
+    def exception(self, err):
+        "Output summary of exception (critical error or program crash)."
+        raise NotImplementedError("subclass does not have `exception` method")
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class TerminalOutput(Output):
+    "Output to terminal stdio."
+
+    def out(self, message):
+        "Print message to stdout."
+        print(message)
+
+    def err(self, message):
+        "Print message to stderr."
+        print(message, file=sys.stderr)
+
+    def exception(self, err):
+        """Print exception summary to stderr with input filename, line number.
+
+        Importantly, output an exception summary for end-users, omitting the
+        traceback and other detail that is irrelevant when attempting to run
+        the program, not debug it.
+
+        Prefix error message with filename and line number, if in context, in
+        order to support conventional error output in which an IDE or $EDITOR
+        can infer which line is the source of the error and provide a link.
+
+        Example output to stderr:
+
+            path/to/file:42: prog: error here on line 42
+
+        In action:
+
+            >>> err = DocumentError("example of an exception")
+            >>> with contextlib.redirect_stderr(sys.stdout):
+            ...     with context(filename="test", line_number=42):
+            ...         TerminalOutput().exception(err)
+            ...
+            test:42: buildme: error: example of an exception
+            >>>
+
+        Without context:
+
+            >>> err = DocumentError("example of an exception")
+            >>> with contextlib.redirect_stderr(sys.stdout):
+            ...     TerminalOutput().exception(err)
+            ...
+            buildme: error: example of an exception
+            >>>
+        """
+        if self.debug:
+            _, value, tb = sys.exc_info()
+            traceback.print_exception(err, value, tb)
+
+        message = ""
+        if context.get("filename"):
+            message += f"{context['filename']}:"
+            if context.get("line_number"):
+                message += f"{context['line_number']}:"
+            message += " "
+
+        message += f"{self.prog}: error: {err!s}"
+
+        self.err(message)
+
+
+## Global Context
+
+
+class Context(collections.UserDict):
+    """Manage global context, e.g. current file, line number.
+
+    Set as context manager, passing one or more keyword arguments:
+
+        with context(key=value):
+            ...
+
+    Get as dict:
+
+        context[key]  #=> value
+        context.get(key)  #=> value or None
+        context.get(key, default)  #=> value or default
+
+    Example:
+
+        >>> context = Context()
+        >>> with context(something="this"):
+        ...     context["something"]
+        ...
+        'this'
+        >>> context.get("something")
+        >>> context.get("something", "default")
+        'default'
+        >>>
+
+    Retain context upon exception, the primary reason for Context:
+
+        >>> with context(something="this"):
+        ...     assert False
+        ...
+        Traceback (most recent call last):
+          ...
+        AssertionError
+        >>> context.get("something")  # Use this to report error in context.
+        'this'
+        >>>
+    """
+
+    @contextlib.contextmanager
+    def __call__(self, **attributes):
+        "Publish global attributes within a context manager."
+        exception = False
+        try:
+            self.data.update(attributes)
+            yield
+        except Exception:
+            exception = True
+            raise
+        finally:
+            if not exception:
+                for key in attributes:
+                    self.data.pop(key, None)
+
+
+context = Context()
+
+
+## Error Definition
+
+
+class DocumentError(RuntimeError):
+    "Input document has invalid directives."
+
+
+## Utility
+
+
+def match_arch(target, arch=None):
+    """True if CPU arch string matches, defaulting to `uname -m`, else False.
+
+    Support wildcards, e.g. "i*86" matches "i386", "i486", "i586", "i686":
+
+        >>> match_arch("x86_64", arch="i686")
+        False
+        >>> match_arch("i*86", arch="i686")
+        True
+        >>>
+
+    """
+    if arch is None:
+        arch = os.uname().machine
+    if "*" in target:
+        target = target.replace("*", ".*")  # Wildcard to regular expression.
+    return bool(re.match(target + "$", arch, flags=re.IGNORECASE))
+
+
+def memoize(fn, maxsize=None):
+    "Decorator to cache function results."
+    decorator = functools.lru_cache(maxsize=maxsize)
+    return decorator(fn)
+
+
+@contextlib.contextmanager
+def open_file_or_stdin(filename, *a, **kw):
+    "Wrap `open`, yielding sys.stdin if filename is '-' (ignoring keywords)."
+    if filename == "-":
+        yield sys.stdin
+    else:
+        with open(filename, *a, **kw) as file:
+            yield file
+
+
+@memoize
+def subclass(cls):
+    "Resolve subclass set of a given class, recursively."
+    sub = lambda cls: cls.__subclasses__()
+    return set(sub(cls)).union(s for c in sub(cls) for s in subclass(c))
+
+
+## Self-Test
+
+
+SAMPLE = f"""
+# Document Title
+
+## Section One
+
+Required:
+
+* `python3`
+* `python3 -m this`
+* `{__file__}`
+
+
+## Section Two
+
+### Subsection A
+
+Run:
+
+    python3 -c "print('Hello, world')"
+
+
+### Subsection B
+
+Run:
+
+```
+python3 -c "print('Hello, world')"
+```
+
+
+## Section Three
+
+Nothing here.
+""".lstrip()
+
+
+def test_sample():
+    """Test program against file containing SAMPLE text.
+
+    Create sample markdown file:
+
+        >>> import tempfile
+        >>> file = tempfile.NamedTemporaryFile(mode="w", prefix="buildme-")
+        >>> _ = file.write(SAMPLE)  # Returns number of bytes.
+        >>> file.flush()
+
+    Parse:
+
+        >>> project = Project(file.name)
+        >>> print(project.document[0].title)
+        Document Title
+        >>> print(project.document[0].section[0].name)
+        Section One
+        >>>
+
+    Run:
+
+        >>> runner = Runner(TerminalOutput())
+        >>> runner.run(project)
+        buildme: work in progress: run
+        >>>
+
+    Run full program at command line:
+
+        >>> import subprocess
+        >>> proc = subprocess.run(
+        ...     [__file__, file.name],
+        ...     stdout=subprocess.PIPE,
+        ...     stderr=subprocess.STDOUT,
+        ... )
+        >>> print(proc.stdout.decode("ascii").strip())
+        buildme: work in progress: run
+        >>>
+
+    Clean up:
+
+        >>> file.close()
+    """
+
+
+def test():
+    "Run self test."
+    failure_count, test_count = doctest.testmod()
+    if not failure_count:
+        print(f"{PROG}: self-test: Ran {test_count} tests. All passed.")
+    return failure_count
+
+
+## Command Line
+
+VERSION = (
+    f"{PROG} {__version__}"
+    + " "
+    + "("
+    + platform.python_implementation().replace("CPython", "Python")
+    + " "
+    + platform.python_version()
+    + ")"
+)
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    "Parse command-line arguments."
+
+    prog = PROG
+
+    @classmethod
+    def build(cls):
+        "Build a configured argument parser instance."
+        description, help = cls.parse_description_help()
+        parser = cls(
+            allow_abbrev=False,
+            description=description,
+            epilog=help,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            prog=cls.prog,
+        )
+        action = parser.add_mutually_exclusive_group(required=False)
+        action.add_argument(
+            "--export",
+            action="store_true",
+            help="export build steps (without running build)",
+        )
+        action.add_argument(
+            "--outline",
+            action="store_true",
+            help="print outline of build steps (without running build)",
+        )
+        action.add_argument(
+            "--clean",
+            action="store_true",
+            help="remove files output by build steps with known effects",
+        )
+        parser.add_argument(
+            "--debug",
+            action="store_true",
+            help=f"include `{cls.prog}` debug output during build",
+        )
+        parser.add_argument(
+            "--version",
+            action="store_true",
+            help=f"output version '{VERSION}' and exit",
+        )
+        parser.add_argument(
+            "file",
+            help="markdown file(s) containing literate build steps",
+            nargs="+",
+        )
+        return parser
+
+    @classmethod
+    def parse_description_help(cls):
+        "Parse command-line usage description and help from source code."
+        with open(__file__) as file:
+            description, help = "", ""
+            for line in file:
+                if line.startswith("#!"):
+                    continue
+                elif not line.startswith("#"):
+                    break
+                elif not description:
+                    description = line[1:].strip()
+                else:
+                    help += "\n" + line[1:].strip()
+            return description, help.strip()
+
+
+class Main:
+    "Dispatch based on command-line arguments."
+
+    output_cls = TerminalOutput
+    runner_cls = Runner
+
+    def __init__(self):
+        self.output = None
+        self.runner = None
+
+    def __call__(self, argv=sys.argv):
+        if "--self-test" in argv:
+            return test()
+
+        if "--version" in argv:
+            print(VERSION)
+            return 0
+
+        parser = ArgumentParser.build()
+        arg = parser.parse_args(args=argv[1:])
+
+        self.output = self.output_cls(debug=arg.debug)
+        self.runner = self.runner_cls(self.output, debug=arg.debug)
+
+        try:
+            project = Project(*arg.file)
+
+            if arg.clean:
+                result = self.clean(project)
+            elif arg.export:
+                result = self.export(project)
+            elif arg.outline:
+                result = self.outline(project)
+            else:
+                result = self.run(project)
+        except Exception as err:
+            self.output.exception(err)
+            result = 1
+
+        return result
+
+    def clean(self, project):
+        "Execute `buildme --clean FILE...`."
+        self.runner.clean(project)
+        return 0
+
+    def export(self, project):
+        "Execute `buildme --export FILE...`."
+        self.runner.export(project)
+        return 0
+
+    def outline(self, project):
+        "Execute `buildme --outline FILE...`."
+        self.runner.outline(project)
+        return 0
+
+    def run(self, project):
+        "Execute `buildme FILE...`."
+        self.runner.run(project)
+        return 0
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+def lib():
+    """Python is an implementation detail; if library absolutely necessary:
+
+    Symlink (or copy) this Python file to add a .py extension.
+    Python can readily import a .py file.
+
+    Otherwise, use `importlib` to import this executable as a module.
+
+    Reference the path to this program:
+
+        >>> filepath = "path/to/buildme"  # Set this.
+        >>> filepath = __file__  # Actual filepath for purpose of this test.
+
+    Use Python import machinery:
+
+        >>> from importlib.machinery import SourceFileLoader
+        >>> from importlib.util import module_from_spec, spec_from_loader
+
+        >>> loader = SourceFileLoader("buildme", filepath)
+        >>> spec = spec_from_loader("buildme", loader)
+        >>> buildme = module_from_spec(spec)
+        >>> spec.loader.exec_module(buildme)
+
+    The `buildme` object is now a module object just like any other:
+
+        >>> buildme.Project
+        <class 'buildme.Project'>
+        >>> buildme.Runner
+        <class 'buildme.Runner'>
+        >>>
+
+    The result is equivalent to that of `import buildme`.
+    """
+
+
+main = Main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
