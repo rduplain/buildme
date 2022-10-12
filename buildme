@@ -681,7 +681,10 @@ class Document:
                                 cmp = cls.from_block(blk)
                                 if cmp:
                                     blk.cmp = cmp
-                                    component.append(cmp)
+                                    if isiter(cmp):
+                                        component += list(cmp)
+                                    else:
+                                        component.append(cmp)
                                     break
                             else:
                                 blk.cmp = None
@@ -1191,6 +1194,96 @@ class Script(Component):
         return None
 
 
+class DirectiveSet(Component, Iterable):
+    """One or more directives indicated by a comment in the text.
+
+    A Comment block can have multiple directives, separated by semi-colons or
+    new lines. The role of this class is to be a one-to-one mapping between a
+    Component and a Comment, then parse the expressions in the comment content
+    for each Directive. This class is a container.
+    """
+
+    Block = Comment
+
+    delimiter_re = "[;\n]"
+    sub = "directive"
+
+    def __init__(self, directive):
+        self.directive = directive
+
+    @classproperty
+    def directive_cls(cls):
+        "Forward declaration for handle to Directive class."
+        return Directive
+
+    @classmethod
+    def from_block(cls, blk):
+        "Override `Component.from_block` in order to parse within Comment."
+        if not isinstance(blk, cls.Block):
+            return None  # Not a Comment.
+
+        if not blk.content:
+            return None  # Comment has no content.
+
+        directive_cls = [c for c in subclass(cls.directive_cls) if c.re]
+
+        # Parse vector of delimited, non-empty comment segments.
+        comment = re.split(cls.delimiter_re, blk.content)
+        comment = [s.strip() for s in comment if s.strip()]
+
+        directive = []
+        unmatched = []
+
+        for part in comment:
+            for c in directive_cls:
+                cmp = cls.from_comment(c, part)
+                if cmp:
+                    cmp.blk = blk
+                    cmp.i = blk.i
+                    directive.append(cmp)
+                    break
+            else:
+                unmatched.append(part)
+
+        if directive and unmatched:
+            msg = "unknown directive: " + ", ".join(repr(s) for s in unmatched)
+            raise DocumentError(msg)
+
+        return cls(directive)
+
+    @classmethod
+    def from_comment(_, cls, s):
+        "Create Directive instance from comment string, else return None"
+        if isinstance(cls.re, str):
+            pattern = [cls.re]
+        elif cls.re is ALL:
+            pattern = []
+        else:
+            pattern = cls.re
+
+        a, kw = (), {}  # Argument tuple, keyword dictionary for new instance.
+
+        for candidate in pattern:
+            match = re.match(candidate, s)
+            if match:
+                a = match.groups()
+                if hasattr(cls, "process_re_groups"):
+                    a = cls.process_re_groups(a)
+                break
+
+        if cls.re is ALL:
+            a = (s,)
+
+        if not a:
+            return None
+
+        return cls(*a, **kw)
+
+
+class Directive(Component):
+    "Information for the machine running the build, not the human."
+
+
 class CommaDelimited:
     "Mixin to split content by comma."
 
@@ -1201,10 +1294,8 @@ class CommaDelimited:
         return ([s.strip() for s in groups[0].split(",")],)
 
 
-class FileEffect(Component, CommaDelimited):
+class FileEffect(Directive, CommaDelimited):
     "A file or directory created by, and owned by, the Section's build."
-
-    Block = Comment
 
     category = "effect"
     re = r"creates?:\s*(.*)"
@@ -1213,10 +1304,8 @@ class FileEffect(Component, CommaDelimited):
         self.file = file
 
 
-class Dependency(Component, CommaDelimited):
+class Dependency(Directive, CommaDelimited):
     "Rebuild current Section if Section referenced as a Dependency changes."
-
-    Block = Comment
 
     category = "dependency"
     re = r"requires?:\s*(.*)"
