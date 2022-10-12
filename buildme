@@ -419,6 +419,11 @@ class ListItem(Block):
         # Parse list item content.
         self.content = re.sub(self.marker_re, "", self.text)
 
+    @property
+    def container(self):
+        "Alias to `self.list` for a generic duck-typed data model."
+        return self.list
+
     @classmethod
     def parse(cls, i, line):
         "Create instances only through `List` construction."
@@ -861,9 +866,9 @@ class Component:
         if not blk.content:
             return None  # Markdown block does not contain content.
 
-        if issubclass(cls.Block, ListItem):  # Matches ListItem, too.
-            # Block class is ListItem, use containing List as context.
-            context = blk.list
+        if getattr(blk, "container", None):
+            # Block is contained by another, need container for lead-in check.
+            context = blk.container
         else:
             context = blk
 
