@@ -26,7 +26,8 @@ Required:
 
 Clone:
 
-* git@github.com:rduplain/qwerty.sh.git including tags v0.5.2 and v0.6.3
+* git@github.com:rduplain/qwerty.sh.git
+  including tags v0.5.2 and v0.6.3
 * git@github.com:rduplain/poorman.git
 
 Download:
@@ -58,7 +59,9 @@ Required programs:
 * `ls`
 * `ldd`
 * Some coffee.
-* `dpkg`
+* And:
+  - `apt`
+    + `dpkg`
 
 Make sure we make it to December (again):
 
@@ -66,7 +69,7 @@ Make sure we make it to December (again):
 
 Setup build:
 
-```
+```sh
 mkdir -p build
 cd build
 ```
@@ -88,12 +91,12 @@ Run:
 
 ```
 cd qwerty.sh
+
 make
 ```
 
-<!-- creates: build -->
-<!-- requires: Section 1 -->
-<!-- requires: Section 1; creates: build -->
+<!-- creates: build --> <!-- requires: Section 1 -->
+
 
 ### Section 4
 
@@ -105,9 +108,9 @@ date
 
 Run again:
 
-```
+~~~
 date
-```
+~~~
 
 <!-- require: Section 1, Section 3 -->
 
@@ -116,9 +119,9 @@ date
 
 Run:
 
-```
-date
-```
+  ```
+  date
+  ```
 
 <!-- requires: Section 1 -->
 <!-- requires: Section 3 -->
@@ -134,17 +137,48 @@ Require nothing.
 Require:
 
 * Nothing.
+  At all.
 
 
 ### Section 8
 
 Still nothing here.
 
+Nothing at all, like:
+
+> Require:
+>
+> * Nothing.
+>   At all.
+
 
 ### Section 9
+
+Just to show that a fence can be within a fence:
+
+  ~~~
+  Run:
+
+  ```
+  date
+  ```
+  ~~~
+
+
+### Section 10
 
 Log when the build completes:
 
 ```
 date
 ```
+
+<!--
+    requires: Section 4
+    requires: Section 5
+-->
+
+
+---
+
+... and it's done.

@@ -8,6 +8,10 @@
 #
 # Indicate build instructions with markdown and a few English words.
 #
+# Text parsing is approximately faithful to the markdown spec, but makes
+# pragmatic concessions when the spec complicates what could be easily fixed
+# by a simple README edit (resulting in text that is better organized).
+#
 # When editing a .md file, use `--outline` and `--export` to confirm document
 # structure, because the literate approach ignores unknown text by default.
 #
@@ -24,6 +28,7 @@
 __version__ = "0.0-dev"
 
 PROG = "buildme"
+
 
 import sys
 
@@ -53,6 +58,11 @@ import traceback
 #     .document = [d]              Document
 #       .section = [sec]           Section
 #         .component = [cmp]       Component
+#           .blk = blk             Block
+#
+#   block = [blk]                  Block
+#     .cmp = cmp                   Component
+#     .line = [s]                  str
 #
 ###
 
@@ -67,7 +77,473 @@ class classproperty(property):
         return decorator.fget(cls)
 
 
-## Data Model & Text Parsing
+## Text Parsing
+
+
+def parse(text):
+    "Parse markdown text (file or iterable) into list of Block objects."
+    return list(link(Block.classify(scan(text))))
+
+
+# Markdown scan states.
+FENCED = object()
+INDENTED = object()
+COMMENT = object()
+LIST = object()
+
+
+def scan(text):
+    """Scan markdown text for its block structure.
+
+    Return `(line number, [line])` pairs, where `[line]` is the list of lines
+    contained by a given block and `line_number` is the position of the first
+    line.
+
+    Spec:
+    https://spec.commonmark.org/0.30/
+    """
+    state, fence = None, "```"
+
+    i, acc = 0, []
+    count = 0
+
+    for line in text:
+        line = line.rstrip()  # Trailing whitespace is never significant.
+        count += 1
+
+        # Continuing a block takes precedence, in order of precedence.
+        if state is FENCED and not re.match(r"\s{0,3}" + fence, line):
+            cont = True
+        elif state is INDENTED and (not line or line.startswith("    ")):
+            cont = True
+        elif state is COMMENT and "-->" not in line:
+            cont = True
+        elif state is LIST and line:
+            cont = True
+        else:
+            cont = False
+
+        if cont:
+            acc.append(line)
+            continue
+
+        # One block ends, another begins.
+        if state is FENCED and re.match(r"\s{0,3}" + fence, line):
+            end = True
+        elif state is INDENTED and (line and not line.startswith("    ")):
+            end = True
+        elif state is COMMENT and "-->" in line:
+            end = True
+        elif state is LIST and not line:
+            end = True
+        elif state is None and acc and not line:
+            end = True
+        else:
+            end = False
+
+        # Only a new, unindented block confirms the end of an indented block.
+        if end and state is INDENTED:
+            if not acc[-1]:
+                acc.pop(-1)  # Remove blank line between blocks.
+            yield i, acc
+            i, acc = 0, []
+            state = None
+            end = False
+
+        # Include the final non-blank line with the block.
+        if end and line:
+            acc.append(line)
+
+        # Yield the ending block.
+        if end:
+            yield i, acc
+            i, acc = 0, []
+            state = None
+            continue
+
+        # Blank lines outside of blocks are insignificant.
+        if not line:
+            continue
+
+        # Determine whether the new block has precedence in continuation.
+        assert state is None
+
+        if re.match(r" {0,3}(```|~~~)\S*", line):
+            state = FENCED
+            fence = re.match(r" {0,3}(```|~~~)\S*", line).group(1)
+        elif line.startswith("    "):
+            state = INDENTED
+        elif "<!--" in line and "-->" not in line:
+            state = COMMENT
+        elif re.match(r"\s*[\*-+] ", line):
+            state = LIST
+
+        # Collect lines into the new block.
+        if not acc:
+            i, acc = count, [line]
+        else:
+            acc.append(line)
+
+    # Yield the final block.
+    if acc:
+        yield i, acc
+
+
+def link(xs):
+    "Set `next` and `prev` attributes to neighbors on each item in iterable."
+    prev = None
+    for x in xs:
+        if prev:
+            prev.next = x
+        prev, x.prev = x, prev
+        x.next = None
+        yield x
+
+
+class Block:
+    "A markdown block."
+
+    def __init__(self, i, line):
+        self.i = i
+        self.line = line
+        self.text = "\n".join(line)
+
+    @classproperty
+    def default(cls):
+        """Use this class when parsing does not return an instance.
+
+        The default block class will appear anywhere a block type is not
+        supported, e.g. HTML blocks.
+        """
+        return Paragraph
+
+    @classmethod
+    def classify(cls, scanned):
+        """Classify markdown blocks from `scan` into types (Python classes).
+
+        Accept the `(line number, [line])` output of `scan`. Call the `parse`
+        class method of each subclass, in arbitrary order, and when a subclass
+        constructs an instance, move on to the next input block. That is,
+        classifying an input block is first come, first serve.
+
+        Handle markdown blocks only, not inline structure.
+        """
+        parser = [c.parse for c in subclass(cls) if c is not cls.default]
+        for i, line in scanned:
+            for parse in parser:
+                parsed = parse(i, line)
+                if parsed:
+                    yield parsed
+                    break
+            else:
+                yield cls.default(i, line)
+
+    @classmethod
+    def parse(cls, i, line):
+        "Given an input block, return an instance (exactly one) or None."
+        raise NotImplementedError("Block subclass must provide `parse`.")
+
+    def __repr__(self):
+        arg = ", ".join(
+            f"{p}={getattr(self, p)!r}"
+            for p in inspect.signature(self.__init__).parameters
+        )
+        return f"{self.__class__.__name__}({arg})"
+
+
+class Paragraph(Block):
+    "Text."
+
+
+class Break(Block):
+    """Thematic break, i.e. horizontal rule.
+
+    Markdown may support inline thematic breaks, but this class only represents
+    blocks. Further, this class only matches thematic breaks on their own,
+    i.e. does not interfere with setext-style headings.
+    """
+
+    @classmethod
+    def parse(cls, i, line):
+        if len(line) == 1 and re.match(r"^(---|___|\*\*\*)$", line[0]):
+            return cls(i, line)
+
+
+class Heading(Block):
+    "Title or section subtitle."
+
+    def __init__(self, i, line):
+        super().__init__(i, line)
+
+        if self.is_setext(line):
+            self.style = "setext"
+            self.content = line[0]
+            self.level = 1 if "=" in line[1] else 2
+        else:
+            self.style = "atx"
+            assert len(line) == 1
+            match = re.match(r"(#+)\s+(.*)", line[0])
+            self.content = match.group(2)
+            self.level = len(match.group(1))
+
+    @classmethod
+    def is_atx(cls, line):
+        return len(line) == 1 and bool(re.match(r"^#{1,6}\s+", line[0]))
+
+    @classmethod
+    def is_setext(cls, line):
+        if len(line) != 2 or len(line[0]) != len(line[1]):
+            return False
+        return bool(re.match(r"^(=+|-+)$", line[1]))
+
+    @classmethod
+    def parse(cls, i, line):
+        if cls.is_setext(line) or cls.is_atx(line):
+            return cls(i, line)
+
+
+class Code(Block):
+    """Code, either indented or fenced.
+
+    Markdown supports indented code fences with up to three spaces of
+    indentation. Markdown also supports end-of-file instead of a closing fence,
+    motivated because backtracking is less efficient, but parsing here does not
+    require backtracking so a closing fence is required.
+    """
+
+    fence_re = r"( {0,3})(```|~~~)(\S*)$"  # Opening fence.
+
+    def __init__(self, i, line):
+        super().__init__(i, line)
+        self.fence = None
+        self.indent = 0
+        self.language = None
+
+        if self.is_fenced(line):
+            # Fenced code blocks support indentation and either ` or ~ fences.
+            self.style = "fenced"
+            match = re.match(self.fence_re, line[0])
+            self.fence = match.group(2)
+            if match.group(1):
+                # Opening fence has indentation.
+                self.indent = len(match.group(1))
+            if match.group(3):
+                # Opening fence has info string, a language by convention.
+                self.language = match.group(3)
+        else:
+            self.style = "indented"
+            self.indent = 4
+
+        # Parse code content.
+        code = line[1:-1] if self.fence else line  # Exclude fence syntax.
+        if self.indent:
+            # Dedent, but only remove spaces.
+            dent = "^ " + "{0," + str(self.indent) + "}"
+            code = [re.sub(dent, "", s) for s in code]
+        self.content = "\n".join(code)
+
+    @classmethod
+    def is_fenced(cls, line):
+        if len(line) < 2:
+            return False
+
+        match = re.match(cls.fence_re, line[0])
+        if match:
+            fence = match.group(2)  # ``` or ~~~
+            return bool(re.match(" {0,3}" + fence + r"\s*$", line[-1]))
+        return False
+
+    @classmethod
+    def is_indented(cls, line):
+        return all([s.startswith("    ") for s in line if s])
+
+    @classmethod
+    def parse(cls, i, line):
+        if cls.is_fenced(line) or cls.is_indented(line):
+            return cls(i, line)
+
+
+class Iterable:
+    "Mixin to iterate through sub-items."
+
+    sub = "item"  # Name of sub-item attribute.
+
+    def __iter__(self):
+        "Implement iterator protocol."
+
+        class Iterator:
+            def __init__(self, item):
+                self.item = item
+                self.index = -1
+                self.length = len(self.item)
+
+            def __next__(self):
+                self.index += 1
+                if self.index >= self.length:
+                    raise StopIteration
+                return self.item[self.index]
+
+        return Iterator(getattr(self, self.sub))
+
+
+class ListItem(Block):
+    "An item in a list, either ordered or unordered."
+
+    marker_re = r"\s*([\-\+\*]\s|[0-9]{1,9}[\.\)]\s)"
+
+    def __init__(self, list, i, line, level=1):
+        super().__init__(i, line)
+        self.list = list
+        self.level = level
+
+        # Track ordered/unordered independently of List.
+        if re.match(r"\s*[0-9]", line[0]):
+            self.style = "ordered"
+        else:
+            self.style = "unordered"
+
+        # Parse the bullet in use, for completeness: `-`, `+`, or `*`.
+        match = re.match(r"\s*([\-\+\*])", line[0])
+        if match:
+            self.bullet = match.group(1)  # Unordered.
+        else:
+            self.bullet = None
+
+        # Parse the ordered list delimiter, for completeness: `.` or `)`.
+        match = re.match(r"\s*[0-9]+([\.\)])", line[0])
+        if match:
+            self.delimiter = match.group(1)  # Ordered.
+        else:
+            self.delimiter = None
+
+        # Parse list item content.
+        self.content = re.sub(self.marker_re, "", self.text)
+
+    @classmethod
+    def parse(cls, i, line):
+        "Create instances only through `List` construction."
+        return
+
+
+class List(Block, Iterable):
+    """A list, either ordered or unordered.
+
+    ListItem instances have `level` attribute counting up from `1`, flattened
+    into a single List instance (instead of nested List instances).
+
+    Treat ordered unordered lists in the same way. Ignore when the bullet or
+    ordered list delimiter changes, instead of starting a new list. Assume all
+    lists are "tight" without blank lines separating list items.  Assume
+    indentation is with spaces only (no tabs).
+
+    In effect, given the parsing assumptions above, a List may contain a mix of
+    ordered and unordered list items, if the source text is disorganized as
+    such. Expect blank lines instead of "fixing" this problem when parsing.
+
+    Any calling code can adjust for mixed bullets/delimiters by inspecting the
+    attributes of the enclosed ListItem instances.
+    """
+
+    list_item_cls = ListItem
+
+    def __init__(self, i, line):
+        super().__init__(i, line)
+
+        # While parsing can result in a mixed list, take note of first item.
+        if re.match(r"\s*[0-9]", line[0]):
+            self.style = "ordered"
+        else:
+            self.style = "unordered"
+
+        # Group continuing lines together.
+        group, acc = [], [line[0]]
+        for s in line[1:]:
+            if re.match(self.list_item_cls.marker_re, s):
+                group, acc = group + [acc], [s]
+            else:
+                acc.append(s)
+        group, acc = group + [acc], []
+
+        # Determine set of indentations.
+        dent = set(re.match(r"(\s*)", acc[0]).group(1) for acc in group)
+        order = sorted(dent, key=lambda s: len(s))
+        level = {s: rank for rank, s in enumerate(order, start=1)}
+
+        # Create ListItem per group, reconstruct `i`, determine indent `level`.
+        item_i, item = i, []
+        for acc in group:
+            ws = re.match(r"(\s*)", acc[0]).group(1)
+            item.append(self.list_item_cls(self, item_i, acc, level=level[ws]))
+            item_i += len(acc)  # Track line number of each list item.
+        self.item = item
+
+    @classmethod
+    def parse(cls, i, line):
+        if re.match(cls.list_item_cls.marker_re, line[0]):
+            return cls(i, line)
+
+
+class Comment(Block):
+    """A single-line or multiline comment, marked by HTML comment syntax.
+
+    Multiple single-line comments on a line are supported, but a single-line
+    comment and the start of a multiline comment on the same line is not
+    supported (because its block structure is ambiguous).
+
+    Multiple single-line comments are, in essence, multiple blocks on a single
+    line. Using HTML in markdown is idiosyncratic. In effect, multiple
+    single-line comments on a line are a multi-line comment, with each
+    single-line comment appending a line to the comment's content.
+    """
+
+    def __init__(self, i, line):
+        super().__init__(i, line)
+
+        # Parse comment within HTML, support multiple comments on a line.
+        comment = []
+        text = "\n".join(line).strip()
+
+        for _ in range(text.count("-->")):  # Upper bound, avoid infinite loop.
+            if not re.search("<!--|-->", text):
+                break
+
+            # Extract `s` from "<!--{s}-->".
+            _, wip = re.split("<!--", text, maxsplit=1)
+            s, text = re.split("-->", wip, maxsplit=1)
+
+            # Strip single-line comment.
+            if "\n" not in s:
+                s = s.strip()
+
+            comment.append(s)
+
+        self.content = "\n".join(comment)
+
+    @classmethod
+    def parse(cls, i, line):
+        if "<!--" in line[0]:
+            return cls(i, line)
+
+
+class Blockquote(Block):
+    "Block quote, i.e. text email style quoting with `> ` notation."
+
+    def __init__(self, i, line):
+        super().__init__(i, line)
+
+        # Determine quote indentation based on first line.
+        # For content, strip quote indentation and empty quoted lines.
+        quote = re.match(r"(\s*>\s*)\S", line[0]).group(1)
+        quoted = [re.sub(rf"^({quote})|(\s*>$)", "", s) for s in line]
+        self.content = "\n".join(quoted)
+
+    @classmethod
+    def parse(cls, i, line):
+        if line[0].lstrip().startswith(">"):
+            return cls(i, line)
+
+
+## Data Model
 
 
 class Project:
@@ -108,9 +584,132 @@ class Document:
 
     def __init__(self, filename):
         self.filename = filename
-        self.name = None
-        self.level = 1
-        self.parse()
+
+        self.name = None  # Default.
+        self.level = 1  # Default.
+
+        self.__class__.Parser.parse(self)
+
+    class Parser:
+        "A collection of functions only sensible to Document internals."
+
+        @classmethod
+        def block_component_cls(parser, blk):
+            "Return relevant Component classes for a given Block class."
+            if not hasattr(parser, "block_component"):  # Cached.
+                # {Block: [Component]}
+                parser.block_component = one_to_many(
+                    subclass(parser.section_cls.component_cls),
+                    key=lambda cls: cls.Block,
+                )
+
+            component_cls = []
+            for blk_cls in type(blk).mro():  # Include base classes.
+                for cls in parser.block_component.get(blk_cls, []):
+                    component_cls.append(cls)
+            return component_cls
+
+        @classmethod
+        def group(parser, block):
+            "Group block instances by each Heading; each group is a Section."
+            group, acc = [], []
+            for blk in block:
+                if isinstance(blk, parser.heading_cls):
+                    if acc:
+                        group.append(acc)
+                    acc = []
+                acc.append(blk)
+            if acc:
+                group.append(acc)
+            return group
+
+        @classproperty
+        def heading_cls(parser):
+            "Forward declaration for handle to Heading class."
+            return Heading
+
+        @classmethod
+        def nonempty(parser, section):
+            "Filter Section collection to instances that are not empty."
+            return list(filter(lambda s: not s.empty, section))
+
+        @classmethod
+        def parse(parser, self):
+            "Parse text into Document with zero or more Section instances."
+
+            heading = None
+
+            with context(filename=self.filename):
+                with open_file_or_stdin(self.filename) as file:
+                    # Parse file into Block instances, group by Heading.
+                    group = parser.group(parse(file))
+
+                    # Find top-level heading, if it exists, for Document title.
+                    heading = parser.title(group)
+                    if heading:
+                        assert group[0].pop(0) is heading  # Remove.
+                        if not group[0]:
+                            group.pop(0)  # No content, remove group.
+
+                        self.name = getattr(heading, "content", self.name)
+                        self.level = getattr(heading, "level", self.level)
+
+                    # Build instances of Section and their Component parts.
+                    self.section = parser.parse_section(self, group)
+
+        @classmethod
+        def parse_section(parser, self, group):
+            "Build instances of Section and Component from block objects."
+
+            section = []
+
+            for block in group:
+                heading, component = None, []
+
+                if isinstance(block[0], Heading):
+                    heading = block[0]
+
+                for blk in block:
+                    for blk in list(blk) if isiter(blk) else [blk]:
+                        with context(line_number=blk.i):
+                            for cls in parser.block_component_cls(blk):
+                                cmp = cls.from_block(blk)
+                                if cmp:
+                                    blk.cmp = cmp
+                                    component.append(cmp)
+                                    break
+                            else:
+                                blk.cmp = None
+
+                section.append(parser.section_cls(self, component, heading))
+
+            return parser.nonempty(section)
+
+        @classproperty
+        def section_cls(parser):
+            "Forward declaration for handle to Section class."
+            return Section
+
+        @classmethod
+        def title(parser, group):
+            """Given block groups, determine top-level Heading of Document.
+
+            If the first section has a heading that is greater than all other
+            section groups in the text, then it is the Document title.
+            """
+            if not group:
+                return None
+
+            if not isinstance(group[0][0], parser.heading_cls):
+                return None
+
+            first = group[0][0].level
+            same = list(filter(lambda g: g[0].level <= first, group[1:]))
+            if not same:
+                return group[0][0]
+
+        def __repr__(self):
+            return f"{self.__class__.__name__}()"
 
     def export(self):
         "Convert object to dictionary."
@@ -128,14 +727,6 @@ class Document:
             + [sec.outline() for sec in self.section]
         )
 
-    def parse(self):
-        "Parse Document title and collection of Section build details."
-        with context(filename=self.filename):
-            with open_file_or_stdin(self.filename) as file:
-                header_attr, self.section = DocumentParser().parse(file.read())
-                if header_attr:
-                    self.name, self.level = header_attr
-
     @property
     def title(self):
         "The top heading in the text, if it exists; else the filename."
@@ -148,38 +739,38 @@ class Document:
 class Section:
     """A section of Document text defining steps of the build process.
 
-    Instantiated with a list of Component instances parsed by DocumentParser.
+    Instantiated with a list of Component instances parsed by `Document.parse`.
     """
 
-    def __init__(self, component, name=None, level=None):
+    def __init__(self, document, component, heading=None):
+        self.document = document
         self.component = component
-        self.name = name or None
-        self.level = level or 1
+
+        # No heading means Section starts at document start.
+        self.name = getattr(heading, "content", None)
+        self.level = getattr(heading, "level", document.level)
+        self.i = getattr(heading, "i", 1)
+
         self.empty = not bool(component)
         self.index()
 
     @classproperty
-    def component_base_cls(cls):
-        "Handle to Component base class."
-        return Component
-
-    @classproperty
     def component_cls(cls):
-        "Resolve Component class set of features appearing in text."
-        return set(filter(lambda c: c.parse, subclass(cls.component_base_cls)))
+        "Forward declaration for handle to Component base class."
+        return Component
 
     def export(self):
         "Convert object to dictionary."
         return {
             "component": [cmp.export() for cmp in self.component],
             "level": self.level,
-            "line": self.line_number,
+            "line": self.i,
             "name": self.name,
         }
 
     def index(self):
         "Index component collection by Component category."
-        for category in self.component_base_cls.category_set:
+        for category in self.component_cls.category_set:
             setattr(self, category, [])
         for cmp in self.component:
             getattr(self, cmp.category).append(cmp)
@@ -214,347 +805,33 @@ class Section:
         return f"{self.__class__.__name__}({arg})"
 
 
-class Format:
-    """Mixin to encode how to extract a given build Component from text.
-
-    Given that a Component is primarily a data class and only has a few
-    declarative attributes on how it appears in text, it would be too much
-    responsibility to manage state of a recursive descent parser.
-
-    Mix in Format definitions instead.
-    """
-
-    @classmethod
-    def parser(cls):
-        "Define a `parse` callable for DocumentParser."
-        raise NotImplementedError("Every Format must provide parser callable.")
-
-
-class Header(Format):
-    """A markdown header, creating instances via `parser`.
-
-    Not a subclass of Component, as a Header is not part of a Section.
-    A Document has one Section per Header.
-    """
-
-    def __init__(self, name, level):
-        self.name = name
-        self.level = level
-
-    @classmethod
-    def parser(cls):
-        "Define a `parse` callable for DocumentParser."
-
-        class Parser:
-            def __init__(self):
-                self.previous = ""
-
-            def __call__(self, line):
-                obj = None
-                match = re.match(r"(#+)\s+(.*)", line)
-                if match is not None:
-                    # Header formatted with leading `#` characters.
-                    obj = cls(name=match.group(2), level=len(match.group(1)))
-                elif re.match(r"^(=+|-+)$", line):
-                    if len(line) == len(self.previous):
-                        # Header formatted with underline characters.
-                        level = 1 if "=" in line else 2
-                        obj = cls(name=self.previous, level=level)
-                self.previous = "" if obj else line  # Avoid duplicates.
-                return obj
-
-        return Parser()
-
-    def __repr__(self):
-        arg = f"name={self.name!r}, level={self.level!r}"
-        return f"{self.__class__.__name__}({arg})"
-
-
-class DocumentParser:
-    "Parse Section instances from a Document text."
-    header_cls = Header
-    section_cls = Section
-
-    def nonempty(self, section):
-        "Filter Section collection to instances that are not empty."
-        return list(filter(lambda s: not s.empty, section))
-
-    def parse(self, text):
-        """Parse Document text into zero or more Section instances.
-
-        1. Get parser from classmethod of each Component subclass.
-        2. Pass each line of text to every parser, collect non-None results.
-        3. Build a Section instance containing all parsed components.
-        """
-        parser = [cls.parser() for cls in self.section_cls.component_cls]
-        parse_header = self.header_cls.parser()
-
-        section = []
-        component = []
-        prev = None
-
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            with context(line_number=line_number, line=line):
-                line = line.rstrip()
-                header = parse_header(line)
-
-                if header:
-                    header.line_number = line_number
-                    if prev:
-                        section.append(self.section(component, prev))
-                    component = []  # Reset.
-                    prev = header
-
-                for parse in parser:
-                    parsed = parse(line)
-                    if parsed:
-                        if not getattr(parsed, "line_number", None):
-                            parsed.line_number = line_number
-                        component.append(parsed)
-
-        section.append(self.section(component, prev))
-
-        return self.title(section), self.nonempty(section)
-
-    def section(self, component, header):
-        "Create a Section instance from a Header and result of text parsing."
-        section = self.section_cls(
-            component,
-            # Support header-less Section (i.e. text with no headers).
-            getattr(header, "name", None),
-            getattr(header, "level", None),
-        )
-        section.line_number = getattr(header, "line_number", 1)
-        return section
-
-    def title(self, section):
-        """Determine Document title heading (name, level) from parsed sections.
-
-        If the first section has a header that is greater than all other
-        sections in the text, then it is the Document title.
-
-        This requires the Section collection to be unfiltered, i.e. it must
-        include empty Section instances in order to be accurate.
-        """
-        if not section:
-            return None, 1
-
-        first = section[0].level
-        same = list(filter(lambda h: h.level <= first, section[1:]))
-        if not same:
-            return section[0].name, section[0].level
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}()"
-
-
-class ListItem(Format):
-    "A markdown list item, creating instances via `parser`."
-    conditional_lead_in = None
-
-    @classmethod
-    def lead_in_pattern(cls, lead_in):
-        "Format lead-in pattern based on declarative subclass attribute."
-        if not lead_in:
-            return None
-
-        if lead_in is not None and not isinstance(lead_in, str):
-            lead_in = "|".join(lead_in)
-
-        return r"({}).*:$".format(lead_in.lower())
-
-    @classmethod
-    def parser(cls):
-        "Define a `parse` callable for DocumentParser."
-
-        class Parser:
-            def __init__(self):
-                self.cond_re = cls.lead_in_pattern(cls.conditional_lead_in)
-                self.lead_in_re = cls.lead_in_pattern(cls.lead_in)
-                self.list_item_re = r"\s*([0-9]\.|[\+\-\*])\s"
-
-                self.reset()
-
-            def reset(self):
-                self.state = "seeking"
-                self.conditional = False
-                self.text = None
-
-            def __call__(self, line):
-                if self.state == "seeking":
-                    self.seeking(line)
-                elif self.state == "pending":
-                    self.pending(line)
-                if self.state == "item":
-                    return self.item(line)
-
-            def seeking(self, line):
-                if re.match(self.lead_in_re, line.lower()):
-                    self.state = "pending"
-
-                if self.cond_re and re.match(self.cond_re, line.lower()):
-                    self.state = "pending"
-                    self.conditional = True
-
-            def pending(self, line):
-                if line:
-                    self.state = "item"
-
-            def item(self, line):
-                if line:
-                    if re.match(self.list_item_re, line):
-                        content = re.sub(self.list_item_re, "", line)
-                        return self.content(content)
-                else:
-                    self.state = "seeking"
-                    self.conditional = False
-
-            def content(self, line):
-                pattern = cls.re
-                if isinstance(pattern, str):
-                    pattern = [pattern]
-
-                for candidate in pattern:
-                    match = re.search(candidate, line)
-                    if match:
-                        groups = match.groups()
-                        if hasattr(cls, "process_groups"):
-                            groups = cls.process_groups(groups)
-                        if self.conditional:
-                            return cls(*groups, conditional=True)
-                        return cls(*groups)
-
-        return Parser()
-
-
-class CodeBlock(Format):
-    "A markdown code block, creating instances via `parser`."
-
-    @classmethod
-    def parser(cls):
-        "Define a `parse` callable for DocumentParser."
-
-        if isinstance(cls.lead_in, str):
-            lead_in = cls.lead_in
-        else:
-            lead_in = "|".join(cls.lead_in)
-
-        class Parser:
-            def __init__(self):
-                self.lead_in_re = r"({}).*:$".format(lead_in.lower())
-
-                self.line_number = None  # Track line where code block starts.
-                self.state = "seeking"
-                self.code = []
-
-            def __call__(self, line):
-                if self.state == "seeking":
-                    self.seeking(line)
-                elif self.state == "pending":
-                    self.pending(line)
-                    if self.state != "pending":
-                        self.line_number = context.get("line_number")
-                    if self.state == "fenced":
-                        return None  # Skip.
-
-                parsed = None
-
-                if self.state == "fenced":
-                    parsed = self.fenced(line)
-                elif self.state == "indented":
-                    parsed = self.indented(line)
-
-                if parsed:
-                    if "\n" in parsed and not parsed.endswith("\n"):
-                        parsed += "\n"
-                    obj = cls(parsed)
-                    obj.line_number, self.line_number = self.line_number, None
-                    return obj
-
-            def seeking(self, line):
-                if re.match(self.lead_in_re, line.lower()):
-                    self.state = "pending"
-
-            def pending(self, line):
-                if re.match(r"```\S*$", line):
-                    self.state = "fenced"
-                elif line.startswith("    "):
-                    self.state = "indented"
-
-            def fenced(self, line):
-                if line != "```":
-                    self.code.append(line)
-                else:
-                    code, self.code = self.code, []
-                    self.state = "seeking"
-                    return "\n".join(code)
-
-            def indented(self, line):
-                if line.startswith("    "):
-                    self.code.append(line[4:])
-                else:
-                    code, self.code = self.code, []
-                    self.state = "seeking"
-                    return "\n".join(code)
-
-        return Parser()
-
-
-class Comment(Format):
-    "A comment in HTML, creating instances via `parser`."
-
-    @classmethod
-    def parser(cls):
-        "Define a `parse` callable for DocumentParser."
-
-        if isinstance(cls.lead_in, str):
-            lead_in = cls.lead_in
-        else:
-            lead_in = "|".join(cls.lead_in)
-
-        def parse(line):
-            pattern = r"\s*<!--\s*{}:\s*(.*)\s*-->".format(lead_in.lower())
-            match = re.match(pattern, line)
-            if match:
-                comment = match.group(1).strip()
-                if hasattr(cls, "parse_line"):
-                    return cls(cls.parse_line(comment))
-                return cls(comment)
-            return None
-
-        return parse
-
-
-class DelimitedComment(Comment):
-    "A delimited list of items packed into a comment in HTML."
-
-    delimiter = ","
-
-    @classmethod
-    def parse_line(self, line):
-        "Process line matched by Comment parser, unpack collection."
-        return [item.strip() for item in line.split(self.delimiter)]
+# Special `re` value indicating that all content is to be captured.
+ALL = object()
 
 
 class Component:
     "A feature within a Section describing a component of the build process."
-    category = None
-    export_exclude = None
-    export_include = None
-    lead_in = None
-    parse = False
-    re = None
-    subcategory = None
+
+    Block = None  # Block class indicating which markdown block has component.
+
+    category = None  # Simplified label for type.
+    conditional_lead_in = None  # Paragraph lead-in for conditional execution.
+    export_exclude = None  # Attribute names to exclude from `export`.
+    export_include = None  # Additional attribute names to include in `export`.
+    lead_in = None  # Paragraph lead-in indicating text is build instruction.
+    re = None  # Regular expression for content within markdown block.
+    subcategory = None  # Additional label within category, optional.
 
     @classproperty
     def category_set(cls):
+        "Set of every `category` declared by a Component subclass."
         return set(c.category for c in subclass(cls) if c.category)
 
     def export(self):
         "Convert object to dictionary."
         include = self.export_include or []
         exclude = self.export_exclude or []
-        export = {"category": self.category, "line": self.line_number}
+        export = {"category": self.category, "line": self.i}
         if getattr(self, "subcategory", None):
             export["subcategory"] = self.subcategory
         for key in list(inspect.signature(self.__init__).parameters) + include:
@@ -565,6 +842,95 @@ class Component:
                 value = value.export()
             export[key] = value
         return export
+
+    @classmethod
+    def from_block(cls, blk):
+        """Create Component instance from Block instance, else return None.
+
+        This class method is called on each Block instance at the end of text
+        processing. The factory method is common to all Component subclasses,
+        whereby class attributes declare how to identify which markdown content
+        defines build instructions.
+        """
+        if not cls.re or not cls.lead_in:
+            return None  # Class does not create instances, i.e. is base class.
+
+        if not isinstance(blk, cls.Block):
+            return None  # Given block is not a Block class for this component.
+
+        if not blk.content:
+            return None  # Markdown block does not contain content.
+
+        if issubclass(cls.Block, ListItem):  # Matches ListItem, too.
+            # Block class is ListItem, use containing List as context.
+            context = blk.list
+        else:
+            context = blk
+
+        if cls.paragraph_lead_in(cls.conditional_lead_in, context):
+            conditional = True
+        elif cls.paragraph_lead_in(cls.lead_in, context):
+            conditional = False
+        else:
+            return None  # Lead-in required, no lead-in language found.
+
+        return cls.from_content(blk, conditional=conditional)
+
+    @classmethod
+    def from_content(cls, blk, conditional=False):
+        """Create Component instance from Block content, else return None.
+
+        This class method assumes all criteria for a given block (and its
+        context) are met for the Component, including lead-in language and
+        block type. That is, this class method primarily exists to be called at
+        the end of the `from_block` class method.
+        """
+        if isinstance(cls.re, str):
+            pattern = [cls.re]
+        elif cls.re is ALL:
+            pattern = []
+        else:
+            pattern = cls.re
+
+        a, kw = (), {}  # Argument tuple, keyword dictionary for new instance.
+
+        if getattr(cls, "conditional_lead_in", None):
+            kw["conditional"] = conditional
+
+        for candidate in pattern:
+            match = re.match(candidate, blk.content, flags=re.MULTILINE)
+            if match:
+                a = match.groups()
+                if hasattr(cls, "process_re_groups"):
+                    a = cls.process_re_groups(a)
+                break
+
+        if cls.re is ALL:
+            a = (blk.content,)
+
+        if not a:
+            return None
+
+        cmp = cls(*a, **kw)
+        cmp.blk = blk
+        cmp.i = blk.i
+        return cmp
+
+    @classmethod
+    def paragraph_lead_in(cls, lead_in, blk):
+        "Determine whether preceding paragraph matches lead-in pattern."
+        if not lead_in:
+            return False
+
+        if not blk.prev or not isinstance(blk.prev, Paragraph):
+            return False
+
+        if not isinstance(lead_in, str):
+            lead_in = "|".join(lead_in)
+
+        lead_in_re = r"({}).*:$".format(lead_in.lower())
+
+        return bool(re.match(lead_in_re, blk.prev.line[-1].lower()))
 
     def outline(self):
         "Provide human-readable outline information of Component feature."
@@ -589,11 +955,14 @@ class Component:
         return f"{self.__class__.__name__}({arg})"
 
 
-class Prerequisite(Component, ListItem):
-    "A requirement that must be met before running the build."
+class Prerequisite(Component):
+    "A requirement that must be met before continuing the build."
+
+    Block = ListItem
+
     category = "prerequisite"
     conditional_lead_in = r"if\s+.*\s*(is|are)\s+(missing|needed|not)"
-    export_exclude = ["value"]
+    export_exclude = ["value"]  # Prefer a field keyed by subcategory.
     lead_in = "require[sd]?|make sure"
 
     def __init__(self, value, conditional=False):
@@ -613,28 +982,35 @@ class Prerequisite(Component, ListItem):
 
 
 class ProgramPrerequisite(Prerequisite):
-    "A program that must be on the $PATH before running the build."
-    parse = True
+    "A program that must be on the $PATH before continuing the build."
+
     re = r"`([^\s/\\]*)`"
 
 
 class FilePrerequisite(Prerequisite):
-    "A file that must exist on the filesystem before running the build."
-    parse = True
+    """A file that must exist on the filesystem before continuing the build.
+
+    In order to disambiguate from `ExpressionPrerequisite`, a file cannot
+    contain spaces.
+    """
+
     re = [
-        r"`(.*/.*)`",
-        r"`(.*\\.*)`",
+        r"`(\S*/[\S/]*)`",  # Unix path separator: /.
+        r"`(\S*\\[\S\\]*)`",  # Windows path separator: \.
     ]
 
 
 class ExpressionPrerequisite(Prerequisite):
-    "A shell expression that must successfully run before running the build."
-    parse = True
+    "A shell expression to run successfully before continuing the build."
+
     re = r"`(.* .*)`"
 
 
-class Download(Component, ListItem):
+class Download(Component):
     "A download step as part of the build."
+
+    Block = ListItem
+
     category = "download"
 
 
@@ -642,9 +1018,9 @@ class TagSpec:
     "Mixin to extract tags from a regular expression group."
 
     @classmethod
-    def process_groups(cls, groups):
+    def process_re_groups(cls, groups):
         "Parse list of tags from comma-delimited text."
-        i = getattr(cls, "tag_group", 1) - 1  # re match is 1-indexed.
+        i = getattr(cls, "tag_group", 1) - 1  # re.match is 1-indexed.
         if i >= len(groups):
             return groups
         head, tag_spec, tail = groups[:i], groups[i], groups[i + 1 :]
@@ -659,8 +1035,8 @@ class TagSpec:
 
 class RepoClone(Download, TagSpec):
     "A repository to clone as part of the build."
+
     lead_in = "clone"
-    parse = True
     re = [
         r"(\S+)\s+as\s+(.*)\s+including\s+tags?\s+(.*)",
         r"(\S+)\s+()including\s+tags?\s+(.*)",
@@ -728,10 +1104,11 @@ class DownloadAttributes:
             return Checksum(algorithm=match.group(1), checksum=match.group(2))
 
     @classmethod
-    def process_groups(cls, groups):
-        i = getattr(cls, "attributes_group", 1) - 1  # re match is 1-indexed.
+    def process_re_groups(cls, groups):
+        i = getattr(cls, "attributes_group", 1) - 1  # re.match is 1-indexed.
         if i >= len(groups):
             return groups
+
         head, text, tail = groups[:i], groups[i], groups[i + 1 :]
 
         attributes = {}
@@ -752,12 +1129,12 @@ class DownloadAttributes:
 
 class WebDownload(Download, DownloadAttributes):
     "A file to download from the web as part of the build."
+
     action = "download"
     attributes_group = 3
     export_exclude = ["attributes"]
     export_include = ["arch", "checksum"]
     lead_in = "download"
-    parse = True
     re = [
         r"(\S+)\s+as\s+(\S+)\s+\((.*)\)",
         r"(\S+)\s*()\((.*)\)",
@@ -785,8 +1162,11 @@ class WebDownload(Download, DownloadAttributes):
         return line
 
 
-class Script(Component, CodeBlock):
+class Script(Component):
     "A script to run as part of the build."
+
+    Block = Code
+
     category = "script"
     lead_in = [
         "create|prep|prepare|setup",
@@ -795,31 +1175,46 @@ class Script(Component, CodeBlock):
         "test",
         "unarchive|unpack",
     ]
-    parse = True
+    re = ALL
 
-    def __init__(self, code):
+    def __init__(self, code, language=None):
         self.code = code
+        self.language = language
 
     def outline_info(self):
         "Skip code listing in outline."
         return None
 
 
-class FileEffect(Component, DelimitedComment):
+class CommaDelimited:
+    "Mixin to split content by comma."
+
+    @classmethod
+    def process_re_groups(cls, groups):
+        "Parse list from comma-delimited text."
+        assert len(groups) == 1
+        return ([s.strip() for s in groups[0].split(",")],)
+
+
+class FileEffect(Component, CommaDelimited):
     "A file or directory created by, and owned by, the Section's build."
+
+    Block = Comment
+
     category = "effect"
-    lead_in = "creates"
-    parse = True
+    re = r"creates?:\s*(.*)"
 
     def __init__(self, file):
         self.file = file
 
 
-class Dependency(Component, DelimitedComment):
+class Dependency(Component, CommaDelimited):
     "Rebuild current Section if Section referenced as a Dependency changes."
+
+    Block = Comment
+
     category = "dependency"
-    lead_in = "requires?"
-    parse = True
+    re = r"requires?:\s*(.*)"
 
     def __init__(self, dependency):
         self.dependency = dependency
@@ -1016,6 +1411,35 @@ class DocumentError(RuntimeError):
 ## Utility
 
 
+def isiter(x):
+    """True if object is iterable (implements iterator protocol), else False.
+
+    Example:
+
+        >>> isiter([])
+        True
+        >>> isiter(object())
+        False
+        >>>
+
+    Checking does not exhaust generators:
+
+        >>> gen = (x for x in range(10))
+        >>> isiter(gen)
+        True
+        >>> isiter(gen)
+        True
+        >>> list(gen)
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        >>>
+    """
+    try:
+        iter(x)
+        return True
+    except TypeError:
+        return False
+
+
 def match_arch(target, arch=None):
     """True if CPU arch string matches, defaulting to `uname -m`, else False.
 
@@ -1049,6 +1473,14 @@ def open_file_or_stdin(filename, *a, **kw):
     else:
         with open(filename, *a, **kw) as file:
             yield file
+
+
+def one_to_many(coll, key):
+    "Index many-to-one collection into a one-to-many lookup."
+    lookup = {}
+    for value in coll:
+        lookup[key(value)] = lookup.get(key(value), []) + [value]
+    return lookup
 
 
 @memoize
