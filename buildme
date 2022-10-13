@@ -367,12 +367,12 @@ class Code(Block):
 
 
 class Iterable:
-    "Mixin to iterate through sub-items."
+    "Mixin to recursively iterate through sub-items, flattened depth-first."
 
     sub = "item"  # Name of sub-item attribute.
 
     def __iter__(self):
-        "Implement iterator protocol."
+        "Iterator protocol, flattening sub-iterables into current iteration."
 
         class Iterator:
             def __init__(self, item):
@@ -384,7 +384,19 @@ class Iterable:
                 self.index += 1
                 if self.index >= self.length:
                     raise StopIteration
-                return self.item[self.index]
+
+                item = self.item[self.index]
+
+                if isiter(item):
+                    # Flatten nested iterable into current iteration.
+                    xs = list(item)
+                    head = self.item[: self.index]
+                    tail = self.item[self.index + 1 :]
+                    self.item = head + xs + tail
+                    self.length += len(xs) - 1
+                    item = self.item[self.index]
+
+                return item
 
         return Iterator(getattr(self, self.sub))
 
