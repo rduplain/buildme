@@ -29,6 +29,9 @@ __version__ = "0.0-dev"
 
 PROG = "buildme"
 
+MAJOR = int(__version__.split(".")[0])
+V = "v" + str(MAJOR)
+
 
 import sys
 
@@ -573,7 +576,7 @@ class Project:
 
     def export(self):
         "Convert object to dictionary."
-        return {"document": [d.export() for d in self.document]}
+        return {"buildme": V, "document": [d.export() for d in self.document]}
 
     def outline(self):
         "Provide human-readable outline of Project features."
@@ -597,6 +600,8 @@ class Document:
 
     class Parser:
         "A collection of functions only sensible to Document internals."
+
+        V_RE = rf"{PROG}\s+v([0-9]+)"  # Directive for minimum major version.
 
         @classmethod
         def block_component_cls(parser, blk):
@@ -648,6 +653,9 @@ class Document:
                 with open_file_or_stdin(self.filename) as file:
                     # Parse file into Block instances, group by Heading.
                     group = parser.group(parse(file))
+
+                    # Before processing, scan for minimum required version.
+                    parser.validate_version(group)
 
                     # Find top-level heading, if it exists, for Document title.
                     heading = parser.title(group)
@@ -715,6 +723,29 @@ class Document:
             same = list(filter(lambda g: g[0].level <= first, group[1:]))
             if not same:
                 return group[0][0]
+
+        @classmethod
+        def validate_version(parser, group, MAJOR=MAJOR):
+            """Scan for a major version directive, fail immediately if not met.
+
+            Importantly, this process scans markdown blocks before they are
+            interpreted by `buildme`.
+            """
+            for block in group:
+                for blk in block:
+                    if not isinstance(blk, Comment):
+                        continue
+                    with context(line_number=blk.i):
+                        for s in blk.line:
+                            match = re.search(parser.V_RE, s)
+                            if match:
+                                major = int(match.group(1))
+                                if major <= MAJOR:
+                                    continue
+                                raise DocumentError(
+                                    f"text requires v{major}"
+                                    + f", but this is: {VERSION}"
+                                )
 
         def __repr__(self):
             return f"{self.__class__.__name__}()"
@@ -1284,6 +1315,22 @@ class Directive(Component):
     "Information for the machine running the build, not the human."
 
 
+class FormatVersion(Directive):
+    "Minimum major version of `buildme` required by input file."
+
+    category = "meta"
+    subcategory = PROG
+    re = Document.Parser.V_RE + "$"  # Document.Parser scan cannot use `$`.
+
+    def __init__(self, version):
+        self.version = version
+
+    @classmethod
+    def process_re_groups(cls, groups):
+        "Convert string version to integer."
+        return (int(groups[0]),)  # Major version only.
+
+
 class CommaDelimited:
     "Mixin to split content by comma."
 
@@ -1664,6 +1711,45 @@ def test_sample():
     Clean up:
 
         >>> file.close()
+    """
+
+
+FUTURE = """
+# Document Title
+
+Required:
+
+* `python4`
+
+<!-- buildme v9999 -->
+
+Run:
+
+```
+date
+```
+
+<!-- creates: nothing; nonexistent-key: would fail if not for v9999 -->
+""".lstrip()
+
+
+def test_future():
+    """Test program against file containing FUTURE text.
+
+    Create sample markdown file:
+
+        >>> import tempfile
+        >>> file = tempfile.NamedTemporaryFile(mode="w", prefix="buildme-")
+        >>> _ = file.write(FUTURE)  # Returns number of bytes.
+        >>> file.flush()
+
+    Parse:
+
+        >>> project = Project(file.name)  # doctest: +ELLIPSIS
+        Traceback (most recent call last):
+            ...
+        DocumentError: text requires v9999, but ...
+        >>>
     """
 
 
