@@ -955,11 +955,16 @@ class Section:
         }
 
     def index(self):
-        "Index component collection by Component category."
+        """Index collection of Component instances.
+
+        * Set an attribute on `self` corresponding to each category.
+        * Link each Component instance back to this Section instance.
+        """
         for category in self.component_cls.category_set:
             setattr(self, category, [])
         for cmp in self.component:
             getattr(self, cmp.category).append(cmp)
+            cmp.section = self
 
     def __repr__(self):
         arg = f"name={self.name!r}, level={self.level!r}"
@@ -1456,11 +1461,185 @@ class Dependency(Directive, CommaDelimited):
         self.dependency = dependency
 
 
+## Component Runner
+
+
+# Status.
+OK = object()
+FAIL = object()
+INFO = object()
+SKIP = object()
+WARN = object()
+
+# Precedence.
+META = object()
+CHECK = object()
+STEP = object()
+
+
+class ComponentRunner:
+    "Build implementation for a specific Component class."
+
+    Component = None  # Component class that this runner runs.
+
+    precedence = STEP  # Semantic order of execution.
+
+    def __init__(self, cmp):
+        self.cmp = cmp
+        self.section = cmp.section
+
+    @classmethod
+    def component_runner_cls(base, cmp):
+        "Return ComponentRunner class to run the given Component instance."
+        if not hasattr(base, "cls_index"):  # Cached.
+            # {Component: ComponentRunner}
+            base.cls_index = {
+                cls.Component: cls for cls in subclass(base) if cls.Component
+            }
+
+        for cls in type(cmp).mro():  # Include base classes.
+            if cls in base.cls_index:
+                return base.cls_index[cmp.__class__]
+
+    def fail(self, *a, **kw):
+        "Alias of `pack` for `FAIL`."
+        return self.pack(FAIL, *a, **kw)
+
+    def info(self, *a, **kw):
+        "Alias of `pack` for `INFO`."
+        return self.pack(INFO, *a, **kw)
+
+    def pack(self, status, i, message):
+        """Pack status update to pass to the caller via `yield`.
+
+        The resulting status update is a means of coordination between the
+        Component runner and the build runner. The build runner has no
+        information about components, other than that they exist and they are
+        contained by Section instances within a Document. Meanwhile, a
+        Component runner has no information about the current build state,
+        other than the current component and what can be inspected within the
+        Section (i.e. other components), or how to report pass/fail or how to
+        log messages.
+
+        Any nontrivial build step has more than one thing to say about its
+        status. Instead accumulating status until the end (poor user
+        experience) or accessing I/O directly (poor style with respect to
+        separation of concerns and organization), the runner responsible for
+        the build step can cooperatively `yield` status updates.
+
+        Runner status updates are loosely modeled after TAP (Test Anything
+        Protocol, testanything.org), specifically the Test Point line format:
+
+            ok 42 - this is the description of the test
+
+        Which is:
+
+            {status} {i} - {message}
+
+        That's the extent to which TAP applies to `buildme`: validate the
+        (status, i, message) triple and present a familiar model.
+
+        `i` is the line number of input text, used throughout the module.
+
+        When a component runner completes its `run`, it is successful if at no
+        point it yielded a `FAIL`, and just one `FAIL` indicates total failure
+        for the given build component. Any summary information can be packed
+        into whatever updates are yielded during `run`. To indicate that the
+        component build step is complete, simply do nothing after the final
+        `yield`.
+        """
+        assert status in (OK, FAIL, INFO, SKIP, WARN)
+        return status, i, message
+
+    def ok(self, *a, **kw):
+        "Alias of `pack` for `OK`."
+        return self.pack(OK, *a, **kw)
+
+    def run(self):
+        "Run the steps corresponding to the given Component instance."
+        raise NotImplementedError("subclass must provide `run`.")
+
+    def skip(self, *a, **kw):
+        "Alias of `pack` for `SKIP`."
+        return self.pack(SKIP, *a, **kw)
+
+    def warn(self, *a, **kw):
+        "Alias of `pack` for `WARN`."
+        return self.pack(WARN, *a, **kw)
+
+    def __repr__(self):
+        arg = ", ".join(
+            f"{p}={getattr(self, p)!r}"
+            for p in inspect.signature(self.__init__).parameters
+        )
+        return f"{self.__class__.__name__}({arg})"
+
+
+class ProgramPrerequisiteRunner(ComponentRunner):
+    "Verify program is on $PATH."
+
+    Component = ProgramPrerequisite
+
+
+class FilePrerequisiteRunner(ComponentRunner):
+    "Verify file exists on the filesystem."
+
+    Component = FilePrerequisite
+
+
+class ExpressionPrerequisiteRunner(ComponentRunner):
+    "Verify shell expression runs successfully."
+
+    Component = ExpressionPrerequisite
+
+
+class WebDownloadRunner(ComponentRunner):
+    "Download a file from the web."
+
+    Component = WebDownload
+
+
+class RepoCloneRunner(ComponentRunner):
+    "Clone a repository."
+
+    Component = RepoClone
+
+
+class ScriptRunner(ComponentRunner):
+    "Run a script."
+
+    Component = Script
+
+
+class FormatVersionRunner(ComponentRunner):
+    """Validate `buildme` major version.
+
+    Expect `validate_version` to be run before Document parsing. This runner
+    reports version validation with the rest of the build output.
+    """
+
+    Component = FormatVersion
+
+
+class FileEffectRunner(ComponentRunner):
+    "Check for file/directory, for build caching and cleaning."
+
+    Component = FileEffect
+
+
+class DependencyRunner(ComponentRunner):
+    "Check for intrabuild dependencies, for build cache invalidation."
+
+    Component = Dependency
+
+
 ## Build Runner
 
 
 class Runner:
     "Command-line entry point to run build for a Project."
+
+    runner_cls = ComponentRunner
 
     def __init__(self, output, debug=False):
         self.output = output
@@ -1482,7 +1661,12 @@ class Runner:
         self.output.out(*a, **kw)
 
     def run(self, project):
-        self.out(f"{PROG}: work in progress: run")
+        for d in project.document:
+            for sec in d.section:
+                for cmp in sec.component:
+                    Runner = self.runner_cls.component_runner_cls(cmp)
+                    runner = Runner(cmp)
+                    self.out(runner)
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.output!r})"
@@ -1795,8 +1979,6 @@ def test_sample():
     Run:
 
         >>> runner = Runner(TerminalOutput())
-        >>> runner.run(project)
-        buildme: work in progress: run
         >>>
 
     Run full program at command line:
@@ -1807,8 +1989,6 @@ def test_sample():
         ...     stdout=subprocess.PIPE,
         ...     stderr=subprocess.STDOUT,
         ... )
-        >>> print(proc.stdout.decode("ascii").strip())
-        buildme: work in progress: run
         >>>
 
     Clean up:
