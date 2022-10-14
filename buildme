@@ -808,7 +808,7 @@ class Document:
         def __repr__(self):
             return f"{self.__class__.__name__}()"
 
-    def annotate(self, width=25):
+    def annotate(self, width=18):
         "Yield markdown text with build components annotated in the margin."
 
         pad = len(str(self.line_count)) + 1
@@ -1108,7 +1108,7 @@ class Prerequisite(Component):
 
     Block = ListItem
 
-    category = "prerequisite"
+    category = "prereq"
     conditional_lead_in = r"if\s+.*\s*(is|are)\s+(missing|needed|not)"
     export_exclude = ["value"]  # Prefer a field keyed by subcategory.
     lead_in = "require[sd]?|make sure"
