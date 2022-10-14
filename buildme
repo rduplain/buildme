@@ -12,7 +12,7 @@
 # pragmatic concessions when the spec complicates what could be easily fixed
 # by a simple README edit (resulting in text that is better organized).
 #
-# When editing a .md file, use `--outline` and `--export` to confirm document
+# When editing a .md file, use `--annotate` and `--export` to confirm document
 # structure, because the literate approach ignores unknown text by default.
 #
 # Use only the Python standard library. Require Python 3.6+.
@@ -64,7 +64,7 @@ import traceback
 #           .blk = blk             Block
 #
 #   block = [blk]                  Block
-#     .cmp = cmp                   Component
+#     .component = [cmp]           Component
 #     .line = [s]                  str
 #
 ###
@@ -586,13 +586,20 @@ class Project:
         self.filename = filename
         self.document = [Document(f) for f in filename]
 
+    def annotate(self):
+        "Yield markdown text with build components annotated in the margin."
+        solo = len(self.document) == 1
+        for item in self.document:
+            if not solo:
+                yield item.filename + ":"
+            for s in item.annotate():
+                yield s
+            if not solo:
+                yield ""
+
     def export(self):
         "Convert object to dictionary."
         return {"buildme": V, "document": [d.export() for d in self.document]}
-
-    def outline(self):
-        "Provide human-readable outline of Project features."
-        return "\n".join(d.outline() for d in self.document)
 
     def __repr__(self):
         arg = ", ".join(repr(f) for f in self.filename)
@@ -651,6 +658,36 @@ class Document:
             return Heading
 
         @classmethod
+        def line_count(parser, block):
+            "Determine total line count of input document."
+            if not block:
+                return 0
+            return block[-1].i + len(block[-1].line) - 1
+
+        @classmethod
+        def matchup(parser, block, component):
+            "Link blocks to their resulting components."
+
+            # Initialize `blk.component` list for each Block instance.
+            for blk in block:
+                blk.component = []
+
+                if isiter(blk):
+                    for b in list(blk):
+                        b.component = []
+
+            # Link `blk.component` back to resulting Component instances.
+            for cmp in component:
+                cmp.blk.component += list(cmp) if isiter(cmp) else [cmp]
+
+            # Collect sub-block components for each container Block instance.
+            for blk in block:
+                if isiter(blk):
+                    blk.component += [
+                        cmp for b in list(blk) for cmp in b.component
+                    ]
+
+        @classmethod
         def nonempty(parser, section):
             "Filter Section collection to instances that are not empty."
             return list(filter(lambda s: not s.empty, section))
@@ -659,28 +696,31 @@ class Document:
         def parse(parser, self):
             "Parse text into Document with zero or more Section instances."
 
-            heading = None
-
             with context(filename=self.filename):
                 with open_file_or_stdin(self.filename) as file:
-                    # Parse file into Block instances, group by Heading.
-                    group = parser.group(parse(file))
+                    # Parse file into Block instances.
+                    self.block = parse(file)
 
                     # Before processing, scan for minimum required version.
-                    parser.validate_version(group)
+                    parser.validate_version(self.block)
+
+                    # Group by Heading.
+                    group = parser.group(self.block)
 
                     # Find top-level heading, if it exists, for Document title.
-                    heading = parser.title(group)
-                    if heading:
-                        assert group[0].pop(0) is heading  # Remove.
+                    self.heading = parser.title(group)
+                    if self.heading:
+                        assert group[0].pop(0) is self.heading  # Remove.
                         if not group[0]:
                             group.pop(0)  # No content, remove group.
 
-                        self.name = getattr(heading, "content", self.name)
-                        self.level = getattr(heading, "level", self.level)
+                        self.name = getattr(self.heading, "content", self.name)
+                        self.level = getattr(self.heading, "level", self.level)
 
                     # Build instances of Section and their Component parts.
                     self.section = parser.parse_section(self, group)
+
+            parser.postprocess(self)
 
         @classmethod
         def parse_section(parser, self, group):
@@ -700,18 +740,25 @@ class Document:
                             for cls in parser.block_component_cls(blk):
                                 cmp = cls.from_block(blk)
                                 if cmp:
-                                    blk.cmp = cmp
                                     if isiter(cmp):
                                         component += list(cmp)
                                     else:
                                         component.append(cmp)
                                     break
-                            else:
-                                blk.cmp = None
 
                 section.append(parser.section_cls(self, component, heading))
 
             return parser.nonempty(section)
+
+        @classmethod
+        def postprocess(parser, self):
+            """Index data in place after `parse`.
+
+            * Count lines in the input document (`self.line_count` int).
+            * Link blocks to their resulting components (`blk.component`).
+            """
+            self.line_count = parser.line_count(self.block)
+            parser.matchup(self.block, self.component)
 
         @classproperty
         def section_cls(parser):
@@ -737,30 +784,117 @@ class Document:
                 return group[0][0]
 
         @classmethod
-        def validate_version(parser, group, MAJOR=MAJOR):
+        def validate_version(parser, block, MAJOR=MAJOR):
             """Scan for a major version directive, fail immediately if not met.
 
             Importantly, this process scans markdown blocks before they are
             interpreted by `buildme`.
             """
-            for block in group:
-                for blk in block:
-                    if not isinstance(blk, Comment):
-                        continue
-                    with context(line_number=blk.i):
-                        for s in blk.line:
-                            match = re.search(parser.V_RE, s)
-                            if match:
-                                major = int(match.group(1))
-                                if major <= MAJOR:
-                                    continue
-                                raise DocumentError(
-                                    f"text requires v{major}"
-                                    + f", but this is: {VERSION}"
-                                )
+            for blk in block:
+                if not isinstance(blk, Comment):
+                    continue
+                with context(line_number=blk.i):
+                    for s in blk.line:
+                        match = re.search(parser.V_RE, s)
+                        if match:
+                            major = int(match.group(1))
+                            if major <= MAJOR:
+                                continue
+                            raise DocumentError(
+                                f"text requires v{major}"
+                                + f", but this is: {VERSION}"
+                            )
 
         def __repr__(self):
             return f"{self.__class__.__name__}()"
+
+    def annotate(self, width=25):
+        "Yield markdown text with build components annotated in the margin."
+
+        pad = len(str(self.line_count)) + 1
+        fmt = lambda c, i, s: c.ljust(width) + str(i).rjust(pad) + " | " + s
+
+        def format_block(blk):
+            """Yield annotation lines for given Block instance.
+
+            `blk.component` is one-to-many.
+
+            A block can have multiple components, e.g. a Comment includes
+            multiple Directive expressions, all of which reference the same
+            Block instance.
+
+            To support one-to-many, many has to be able to fit in the margin of
+            one. This requires bookkeeping of whether the annotation process
+            can step forward in the line count, in the case of multi-line text
+            for a block, or whether additional non-numbered lines must be
+            generated in order to make room for all Component instances.
+            """
+            nonlocal i  # Modify `i` from function containing this one.
+
+            # Group Component instances by category.
+            by_category = lambda cmp: (cmp.category, cmp.subcategory)
+            group = itertools.groupby(blk.component, key=by_category)
+
+            # Prepare bookkeeping.
+            group_iter, line_iter = iter(group), iter(blk.line)
+            end = i + len(blk.line)  # Last line number in Block text.
+
+            # Set up control flow. See `fmt` for `c`, `i`, `s` usage.
+            c, fmt_i, s = "...", i, "..."
+
+            while c or fmt_i or s:
+                # Advance line number, or not.
+                if i < end:
+                    fmt_i = i
+                    i += 1
+                else:
+                    fmt_i = ""
+
+                # Summarize Component group.
+                _, component = next(group_iter, (None, []))
+                component = list(component)
+                if len(component) > 1:
+                    c = f"{component[0].label} x{len(component)}"  # label x2
+                elif component:
+                    c = component[0].label
+                else:
+                    c = ""
+
+                # Get next line of Block text, if additional lines remain.
+                s = next(line_iter, "")
+
+                if c or fmt_i or s:
+                    yield fmt(c=c, i=fmt_i, s=s)
+
+        # Iterate all blocks.
+        i = 1
+
+        for blk in self.block:
+            for blk in list(blk) if isiter(blk) else [blk]:
+                while i < blk.i:
+                    # Empty lines until start of Block text.
+                    yield fmt(c="", i=i, s="")
+                    i += 1
+
+                if not blk.component:
+                    # No annotation because no Component instances.
+                    for s in blk.line:
+                        yield fmt(c="", i=i, s=s)
+                        i += 1
+                    continue
+
+                for s in format_block(blk):
+                    # Annotate.
+                    yield s
+
+    @property
+    def component(self):
+        "Flattened access to Component instances contained within sections."
+        component = []
+        for sec in self.section:
+            for cmp in sec.component:
+                component += list(cmp) if isiter(cmp) else [cmp]
+        return component
 
     def export(self):
         "Convert object to dictionary."
@@ -770,13 +904,6 @@ class Document:
             "name": self.name,
             "section": [sec.export() for sec in self.section],
         }
-
-    def outline(self):
-        "Provide human-readable outline of Document features."
-        return "\n".join(
-            [f"{' ' * (self.level - 1)}{self.title}"]
-            + [sec.outline() for sec in self.section]
-        )
 
     @property
     def title(self):
@@ -825,31 +952,6 @@ class Section:
             setattr(self, category, [])
         for cmp in self.component:
             getattr(self, cmp.category).append(cmp)
-
-    def outline(self):
-        "Provide human-readable outline of Section features."
-        indent = " " * (self.level - 1)
-        line = []
-
-        if self.name:
-            line.append(f"{indent}{self.name}")
-
-        by_category = lambda x: x.category
-        for category, xs in itertools.groupby(self.component, key=by_category):
-            xs = list(xs)
-            if not xs[0].outline_info():
-                if len(xs) == 1:
-                    line += [f"{indent} {category}"]
-                else:
-                    line += [f"{indent} {category} x{len(xs)}"]
-            elif len(xs) == 1:
-                line += [f"{indent} {xs[0].outline()}"]
-            else:
-                line += [f"{indent} {category}:"]
-                for x in xs:
-                    line += [f"{indent}  {x.outline_info()}"]
-
-        return "\n".join(line)
 
     def __repr__(self):
         arg = f"name={self.name!r}, level={self.level!r}"
@@ -967,6 +1069,16 @@ class Component:
         cmp.i = blk.i
         return cmp
 
+    @property
+    def label(self):
+        "Format a class-level label using category and subcategory."
+        if not self.category:
+            return ""
+        label = self.category
+        if self.subcategory:
+            label = self.subcategory + " " + self.category
+        return label
+
     @classmethod
     def paragraph_lead_in(cls, lead_in, blk):
         "Determine whether preceding paragraph matches lead-in pattern."
@@ -982,21 +1094,6 @@ class Component:
         lead_in_re = r"({}).*:$".format(lead_in.lower())
 
         return bool(re.match(lead_in_re, blk.prev.line[-1].lower()))
-
-    def outline(self):
-        "Provide human-readable outline information of Component feature."
-        line = self.outline_info()
-        if line:
-            return f"{self.category}: {line}"
-        return self.category
-
-    def outline_info(self):
-        "Provide outline information using first positional argument."
-        for key in inspect.signature(self.__init__).parameters:
-            value = getattr(self, key, None)
-            if type(value) in (list, tuple):
-                value = ", ".join(value)
-            return str(value) if value else None
 
     def __repr__(self):
         arg = ", ".join(
@@ -1103,15 +1200,6 @@ class RepoClone(Download, TagSpec):
         self.directory = directory or None
         self.tag = tag or None
 
-    def outline_info(self):
-        "Provide info on clone configuration."
-        line = self.repo
-        if self.directory:
-            line += f" as {self.directory}"
-        if self.tag:
-            line += f" ({', '.join(self.tag)})"
-        return line
-
 
 class Checksum:
     "An algorithm and checksum for use in download verification."
@@ -1203,15 +1291,6 @@ class WebDownload(Download, DownloadAttributes):
         for k, v in attributes.items():
             setattr(self, k, v)
 
-    def outline_info(self):
-        "Provide info on download configuration."
-        line = self.url
-        if self.filename:
-            line += f" as {self.filename}"
-        if self.checksum:
-            line += f" ({self.checksum.algorithm})"
-        return line
-
 
 class Script(Component):
     "A script to run as part of the build."
@@ -1231,10 +1310,6 @@ class Script(Component):
     def __init__(self, code, language=None):
         self.code = code
         self.language = language
-
-    def outline_info(self):
-        "Skip code listing in outline."
-        return None
 
 
 class DirectiveSet(Component, Iterable):
@@ -1383,6 +1458,9 @@ class Runner:
         self.output = output
         self.debug = debug
 
+    def annotate(self, project):
+        self.out(project.annotate())
+
     def clean(self, project):
         self.out(f"{PROG}: work in progress: clean")
 
@@ -1391,9 +1469,6 @@ class Runner:
 
     def export(self, project):
         self.out(json.dumps(project.export(), indent=2))
-
-    def outline(self, project):
-        self.out(project.outline())
 
     def out(self, *a, **kw):
         self.output.out(*a, **kw)
@@ -1437,11 +1512,11 @@ class TerminalOutput(Output):
 
     def out(self, message):
         "Print message to stdout."
-        print(message)
+        self.print(message)
 
     def err(self, message):
         "Print message to stderr."
-        print(message, file=sys.stderr)
+        self.print(message, file=sys.stderr)
 
     def exception(self, err):
         """Print exception summary to stderr with input filename, line number.
@@ -1491,6 +1566,14 @@ class TerminalOutput(Output):
         message += f"{self.prog}: error: {err!s}"
 
         self.err(message)
+
+    def print(self, message, **option):
+        "Wrap print to iterate when output is a non-string iterable."
+        if not isinstance(message, str) and isiter(message):
+            for s in message:
+                print(s, **option)
+        else:
+            print(message)
 
 
 ## Global Context
@@ -1804,14 +1887,14 @@ class ArgumentParser(argparse.ArgumentParser):
         )
         action = parser.add_mutually_exclusive_group(required=False)
         action.add_argument(
+            "--annotate",
+            action="store_true",
+            help="print annotated markdown (without running build)",
+        )
+        action.add_argument(
             "--export",
             action="store_true",
             help="export build steps (without running build)",
-        )
-        action.add_argument(
-            "--outline",
-            action="store_true",
-            help="print outline of build steps (without running build)",
         )
         action.add_argument(
             "--clean",
@@ -1879,12 +1962,12 @@ class Main:
         try:
             project = Project(*arg.file)
 
-            if arg.clean:
+            if arg.annotate:
+                result = self.annotate(project)
+            elif arg.clean:
                 result = self.clean(project)
             elif arg.export:
                 result = self.export(project)
-            elif arg.outline:
-                result = self.outline(project)
             else:
                 result = self.run(project)
         except Exception as err:
@@ -1892,6 +1975,11 @@ class Main:
             result = 1
 
         return result
+
+    def annotate(self, project):
+        "Execute `buildme --annotate FILE...`."
+        self.runner.annotate(project)
+        return 0
 
     def clean(self, project):
         "Execute `buildme --clean FILE...`."
@@ -1901,11 +1989,6 @@ class Main:
     def export(self, project):
         "Execute `buildme --export FILE...`."
         self.runner.export(project)
-        return 0
-
-    def outline(self, project):
-        "Execute `buildme --outline FILE...`."
-        self.runner.outline(project)
         return 0
 
     def run(self, project):

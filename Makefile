@@ -6,7 +6,7 @@ build: setup
 	black --line-length 79 --no-color buildme
 
 sample:
-	./buildme --outline --debug ./doc/sample.md
+	./buildme --annotate --debug ./doc/sample.md
 	./buildme --export --debug ./doc/sample.md
 
 setup:

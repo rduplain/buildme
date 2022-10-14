@@ -19,7 +19,7 @@ Point the `buildme` program at one or more markdown files (they do not have to
 be README, and only trusted files). Beyond what's specified in the project
 build, the only requirement is Python 3.6+ (2016).
 
-When developing a README, use `buildme --outline README.md` or `buildme
+When developing a README, use `buildme --annotate README.md` or `buildme
 --export README.md` to review the document structure. The _literate_ approach
 will ignore plain language in the document, and it is useful to confirm that
 everything parses correctly before running the build.
