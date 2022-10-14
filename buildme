@@ -203,6 +203,36 @@ def link(xs):
         yield x
 
 
+def block_flatten(block):
+    """Flatten list of Block instances so that all sub items are at root level.
+
+    Iterable Block instances exist because markdown has a concept of container
+    blocks, not just for inline formatting but to contain other blocks
+    (e.g. blockquote or list).
+
+    For the purpose of literate build instructions, nested blocks only have
+    significance with regard to neighbor blocks, i.e. to determine whether the
+    Paragraph before a ListItem or Code block has relevant lead-in
+    language. Once linked (via `link` which adds `next` and `prev`), nested
+    Block semantics only get in the way. In terms of Block collections, a
+    Document only needs to iterate all Block instances (and their resulting
+    Component instances).
+
+    Therefore, flatten after markdown parsing (`link`) and before processing.
+
+    The flatten operation creates a new list but is "lossless" in that the
+    hierarchy is still accessible by inspecting the `container` of a Block
+    instance (if it exists).
+    """
+    acc = []
+    for blk in block:
+        if isiter(blk):
+            acc += list(blk)
+        else:
+            acc.append(blk)
+    return acc
+
+
 class Block:
     "A markdown block."
 
@@ -665,29 +695,6 @@ class Document:
             return block[-1].i + len(block[-1].line) - 1
 
         @classmethod
-        def matchup(parser, block, component):
-            "Link blocks to their resulting components."
-
-            # Initialize `blk.component` list for each Block instance.
-            for blk in block:
-                blk.component = []
-
-                if isiter(blk):
-                    for b in list(blk):
-                        b.component = []
-
-            # Link `blk.component` back to resulting Component instances.
-            for cmp in component:
-                cmp.blk.component += list(cmp) if isiter(cmp) else [cmp]
-
-            # Collect sub-block components for each container Block instance.
-            for blk in block:
-                if isiter(blk):
-                    blk.component += [
-                        cmp for b in list(blk) for cmp in b.component
-                    ]
-
-        @classmethod
         def nonempty(parser, section):
             "Filter Section collection to instances that are not empty."
             return list(filter(lambda s: not s.empty, section))
@@ -699,7 +706,7 @@ class Document:
             with context(filename=self.filename):
                 with open_file_or_stdin(self.filename) as file:
                     # Parse file into Block instances.
-                    self.block = parse(file)
+                    self.block = block_flatten(parse(file))
 
                     # Before processing, scan for minimum required version.
                     parser.validate_version(self.block)
@@ -735,16 +742,16 @@ class Document:
                     heading = block[0]
 
                 for blk in block:
-                    for blk in list(blk) if isiter(blk) else [blk]:
-                        with context(line_number=blk.i):
-                            for cls in parser.block_component_cls(blk):
-                                cmp = cls.from_block(blk)
-                                if cmp:
-                                    if isiter(cmp):
-                                        component += list(cmp)
-                                    else:
-                                        component.append(cmp)
-                                    break
+                    with context(line_number=blk.i):
+                        for cls in parser.block_component_cls(blk):
+                            cmp = cls.from_block(blk)
+                            if cmp:
+                                if isiter(cmp):
+                                    blk.component = list(cmp)
+                                else:
+                                    blk.component = [cmp]
+                                component += blk.component
+                                break
 
                 section.append(parser.section_cls(self, component, heading))
 
@@ -755,10 +762,12 @@ class Document:
             """Index data in place after `parse`.
 
             * Count lines in the input document (`self.line_count` int).
-            * Link blocks to their resulting components (`blk.component`).
+            * Initialize `blk.component` wherever it is unset.
             """
             self.line_count = parser.line_count(self.block)
-            parser.matchup(self.block, self.component)
+
+            for blk in self.block:
+                blk.component = getattr(blk, "component", [])
 
         @classproperty
         def section_cls(parser):
@@ -870,22 +879,21 @@ class Document:
         i = 1
 
         for blk in self.block:
-            for blk in list(blk) if isiter(blk) else [blk]:
-                while i < blk.i:
-                    # Empty lines until start of Block text.
-                    yield fmt(c="", i=i, s="")
+            while i < blk.i:
+                # Empty lines until start of Block text.
+                yield fmt(c="", i=i, s="")
+                i += 1
+
+            if not blk.component:
+                # No annotation because no Component instances.
+                for s in blk.line:
+                    yield fmt(c="", i=i, s=s)
                     i += 1
+                continue
 
-                if not blk.component:
-                    # No annotation because no Component instances.
-                    for s in blk.line:
-                        yield fmt(c="", i=i, s=s)
-                        i += 1
-                    continue
-
-                for s in format_block(blk):
-                    # Annotate.
-                    yield s
+            for s in format_block(blk):
+                # Annotate.
+                yield s
 
     @property
     def component(self):
