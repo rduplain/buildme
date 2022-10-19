@@ -73,6 +73,12 @@ import traceback
 ## Class Utility
 
 
+# This module makes extensive use of classes, for two purposes:
+#
+# 1. Data modeling, of text to parse, the parser, and the parsed result.
+# 2. Namespace, in which a class is a submodule within a single-file program.
+
+
 class classproperty(property):
     "Use a class method as a property (combine @classmethod with @property)."
 
